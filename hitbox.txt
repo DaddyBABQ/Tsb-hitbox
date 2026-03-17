@@ -1,0 +1,1037 @@
+local lp = game.Players.LocalPlayer
+local char = lp.Character or lp.CharacterAdded:Wait()
+local hrp = char:WaitForChild("HumanoidRootPart")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local camera = workspace.CurrentCamera
+local humanoid = char:WaitForChild("Humanoid")
+
+-- ══════════════════════════════════════════
+-- SETTINGS
+-- ══════════════════════════════════════════
+local CFG = {
+    proximityRange   = 35,   -- auto-teleport to enemy if further than this
+    safeReturnHP     = 50,   -- return to enemy when HP above this %
+    safeTriggerHP    = 50,   -- go safe when HP below this %
+    killZoneLimit    = 10,   -- after this many saves, stop saving
+    lowHPTrigger     = 10,   -- % HP to auto-go safe
+    safeY            = 5000, -- sky platform Y
+    edgeLimit        = 480,  -- map boundary
+}
+
+-- ══════════════════════════════════════════
+-- HITBOX STATE
+-- ══════════════════════════════════════════
+getgenv().ATCH = false
+getgenv().EN = nil
+getgenv().connections = {}
+getgenv().lockedTarget = nil
+
+local active         = false
+local cameraLocked   = false
+local posHistory     = {}
+local timeHistory    = {}
+local HISTORY        = 6
+local lastHP         = humanoid.Health
+local damagedUntil   = 0
+
+-- ══════════════════════════════════════════
+-- SAFE GUARD STATE
+-- ══════════════════════════════════════════
+local safePlatform    = nil
+local isSafeMode      = false
+local safeCD          = false
+local isInvis         = false
+local originalSizes   = {}
+local killZoneSaves   = 0  -- counter — after CFG.killZoneLimit, stop saving
+local proximityActive = false -- auto-snap to enemy
+
+local safeSettings = {
+    autoSafe      = true,
+    antiVoid      = true,
+    deathInvis    = true,
+    autoProximity = true,
+}
+
+-- ══════════════════════════════════════════
+-- HITBOX HELPERS
+-- ══════════════════════════════════════════
+local function updateHistory(name, pos)
+    if not posHistory[name] then posHistory[name]={} timeHistory[name]={} end
+    table.insert(posHistory[name], pos)
+    table.insert(timeHistory[name], tick())
+    if #posHistory[name] > HISTORY then
+        table.remove(posHistory[name],1) table.remove(timeHistory[name],1)
+    end
+end
+
+local function getVelAndAccel(name)
+    local pos = posHistory[name]
+    local times = timeHistory[name]
+    if not pos or #pos < 3 then return Vector3.zero, Vector3.zero end
+    local totalVel, totalWeight = Vector3.zero, 0
+    for i = 2, #pos do
+        local dt = times[i]-times[i-1]
+        if dt > 0 and dt < 0.15 then
+            local w = i*i
+            totalVel += ((pos[i]-pos[i-1])/dt)*w
+            totalWeight += w
+        end
+    end
+    local vel = totalWeight > 0 and (totalVel/totalWeight) or Vector3.zero
+    local accel = Vector3.zero
+    if #pos >= 3 then
+        local dt1=times[#pos-1]-times[#pos-2]
+        local dt2=times[#pos]-times[#pos-1]
+        if dt1>0 and dt2>0 then
+            local v1=(pos[#pos-1]-pos[#pos-2])/dt1
+            local v2=(pos[#pos]-pos[#pos-1])/dt2
+            accel=(v2-v1)/dt2
+        end
+    end
+    return vel, accel
+end
+
+local function isSafeToRestore(oldCFrame)
+    if oldCFrame.Position.Y < 400 then return false end
+    if tick() < damagedUntil then return false end
+    if math.abs(hrp.AssemblyLinearVelocity.Y) > 30 then return false end
+    return true
+end
+
+local function findTarget()
+    if getgenv().lockedTarget then
+        local t = getgenv().lockedTarget
+        if t and t.Parent then
+            local h = t.Parent:FindFirstChildOfClass("Humanoid")
+            if h and h.Health > 0 then return t end
+        end
+        getgenv().lockedTarget = nil
+    end
+    local dist, nearest = math.huge, nil
+    for _, part in pairs(workspace.Live:GetChildren()) do
+        if part:IsA("Model") and part:FindFirstChild("HumanoidRootPart") and part ~= char then
+            local h = part:FindFirstChildOfClass("Humanoid")
+            if h and h.Health > 0 then
+                local d = (part.HumanoidRootPart.Position-hrp.Position).Magnitude
+                if d < dist then dist=d nearest=part.HumanoidRootPart end
+            end
+        end
+    end
+    return nearest
+end
+
+local function stopHitbox()
+    getgenv().ATCH = false
+    for _, conn in pairs(getgenv().connections) do pcall(function() conn:Disconnect() end) end
+    getgenv().connections = {}
+    pcall(function() RunService:UnbindFromRenderStep("HBCam") end)
+    pcall(function() camera.CameraSubject=humanoid camera.CameraType=Enum.CameraType.Custom end)
+end
+
+local function makeHeadInvisible()
+    pcall(function()
+        local head = char:FindFirstChild("Head")
+        if head then
+            head.LocalTransparencyModifier = 1
+            -- Also hide face/hair accessories
+            for _, v in ipairs(char:GetChildren()) do
+                if v:IsA("Accessory") then
+                    local mesh = v:FindFirstChildOfClass("SpecialMesh")
+                    local part = v:FindFirstChildOfClass("Part") or v:FindFirstChild("Handle")
+                    if part then part.LocalTransparencyModifier = 1 end
+                end
+            end
+        end
+    end)
+end
+
+local function startHitbox()
+    stopHitbox()
+    task.wait(0.1)
+    getgenv().ATCH = true
+
+    local e = Instance.new("Part")
+    e.Size=Vector3.new(0.5,0.5,0.5) e.CanCollide=false e.CanTouch=false
+    e.Anchored=true e.Transparency=1 e.Parent=char
+
+    local p = Instance.new("Part",char)
+    p.Size=Vector3.new(0.5,0.5,0.5) p.CanCollide=false p.CanTouch=false
+    p.Anchored=true p.Transparency=1
+
+    getgenv().val = e
+    local WEIGHT = 15
+
+    local function updateSubject()
+        -- Keep head invisible every frame
+        makeHeadInvisible()
+
+        if cameraLocked then
+            local en = findTarget()
+            if en then
+                local lookDir = Vector3.new(en.Position.X-hrp.Position.X,0,en.Position.Z-hrp.Position.Z)
+                if lookDir.Magnitude > 0.1 then
+                    hrp.CFrame = hrp.CFrame:Lerp(CFrame.lookAt(hrp.Position,hrp.Position+lookDir),0.15)
+                end
+            end
+            camera.CameraType=Enum.CameraType.Custom
+            camera.CameraSubject=humanoid
+            return
+        end
+        if UserInputService.MouseBehavior==Enum.MouseBehavior.LockCenter then
+            local lookXZ = Vector3.new(camera.CFrame.LookVector.X,0,camera.CFrame.LookVector.Z)
+            if lookXZ.Magnitude > 0.01 then hrp.CFrame=CFrame.lookAt(hrp.Position,hrp.Position+lookXZ) end
+        end
+        if (camera.CFrame.Position-p.Position).Magnitude<1 or
+           (camera.CFrame.Position-getgenv().val.Position).Magnitude<1 then
+            camera.CameraSubject=humanoid p.Position=getgenv().val.Position
+        else
+            camera.CameraSubject=p
+            TweenService:Create(p,TweenInfo.new(2/WEIGHT),{Position=e.Position}):Play()
+        end
+    end
+
+    getgenv().connections["HBCam"] = RunService:BindToRenderStep("HBCam",Enum.RenderPriority.First.Value,updateSubject)
+    getgenv().val = e
+
+    getgenv().connections["HPWatch"] = RunService.Heartbeat:Connect(function()
+        local hp = humanoid.Health
+        if hp < lastHP then damagedUntil=tick()+0.4 end
+        lastHP = hp
+    end)
+
+    getgenv().connections["HBMain"] = RunService.Heartbeat:Connect(function()
+        if not active then return end
+        local en = findTarget()
+        if not en then return end
+        getgenv().EN = en
+        local name = tostring(en)
+        updateHistory(name, en.Position)
+        local vel,accel = getVelAndAccel(name)
+        local xzSpeed = math.sqrt(vel.X*vel.X+vel.Z*vel.Z)
+        local predTime = xzSpeed>40 and 1/10 or xzSpeed>25 and 1/16 or xzSpeed>10 and 1/24 or xzSpeed>3 and 1/35 or 0
+        local predX = en.Position.X+vel.X*predTime+0.5*accel.X*predTime*predTime
+        local predZ = en.Position.Z+vel.Z*predTime+0.5*accel.Z*predTime*predTime
+        local dX,dZ = predX-en.Position.X, predZ-en.Position.Z
+        local dMag = math.sqrt(dX*dX+dZ*dZ)
+        if dMag > 7 then local s=7/dMag predX=en.Position.X+dX*s predZ=en.Position.Z+dZ*s end
+        local old = hrp.CFrame
+        local old2 = char.Head.CFrame
+        e.CFrame = old2
+        if not isSafeToRestore(old) then return end
+        hrp.CFrame = CFrame.new(predX,441-9,predZ)*CFrame.Angles(math.rad(90),0,0)
+        e.CFrame = old2
+        RunService.RenderStepped:Wait()
+        hrp.CFrame = old
+        hrp.CFrame = CFrame.lookAt(hrp.Position,Vector3.new(en.Position.X,hrp.Position.Y,en.Position.Z))
+    end)
+
+    task.spawn(function()
+        repeat task.wait(0.1) until not active or humanoid.Health<=0
+        pcall(function() e:Destroy() end)
+        pcall(function() p:Destroy() end)
+        stopHitbox()
+    end)
+end
+
+-- ══════════════════════════════════════════
+-- SAFE GUARD SYSTEM
+-- ══════════════════════════════════════════
+local function createPlatform()
+    if safePlatform then pcall(function() safePlatform:Destroy() end) end
+    safePlatform = Instance.new("Part")
+    safePlatform.Size = Vector3.new(80,2,80)
+    safePlatform.Position = Vector3.new(0,CFG.safeY,0)
+    safePlatform.Anchored = true
+    safePlatform.CanCollide = true
+    safePlatform.Locked = true
+    safePlatform.BrickColor = BrickColor.new("Really black")
+    safePlatform.Material = Enum.Material.SmoothPlastic
+    safePlatform.CastShadow = false
+    safePlatform.Parent = workspace
+    local sg=Instance.new("SurfaceGui") sg.Face=Enum.NormalId.Top sg.Parent=safePlatform
+    local lb=Instance.new("TextLabel") lb.Size=UDim2.new(1,0,1,0)
+    lb.BackgroundTransparency=1 lb.Text="🛡️ SAFE"
+    lb.TextColor3=Color3.fromRGB(60,200,120)
+    lb.Font=Enum.Font.GothamBold lb.TextSize=60 lb.Parent=sg
+end
+
+local function makeInvisible()
+    if isInvis then return end
+    isInvis = true
+    originalSizes = {}
+    pcall(function()
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                originalSizes[part] = part.Size
+                part.Size = Vector3.new(0.001,0.001,0.001)
+            end
+        end
+    end)
+end
+
+local function makeVisible()
+    if not isInvis then return end
+    isInvis = false
+    pcall(function()
+        for part, size in pairs(originalSizes) do
+            if part and part.Parent then part.Size = size end
+        end
+    end)
+    originalSizes = {}
+end
+
+local _statusUpdateFn = nil
+
+local function goSafe(reason)
+    if safeCD then return end
+    -- Check kill zone save limit
+    if reason == "void" or reason == "edge" then
+        killZoneSaves += 1
+        if killZoneSaves > CFG.killZoneLimit then
+            -- Stop saving — let the void kill us
+            return
+        end
+    end
+    safeCD = true
+    isSafeMode = true
+    if not safePlatform or not safePlatform.Parent then createPlatform() end
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.CFrame = CFrame.new(0, CFG.safeY+7, 0)
+    end
+    if _statusUpdateFn then _statusUpdateFn(reason, killZoneSaves) end
+    task.delay(3, function()
+        safeCD = false
+        -- Don't exit safe mode here — HP system handles return
+        if _statusUpdateFn then _statusUpdateFn("monitoring", killZoneSaves) end
+    end)
+end
+
+-- ══════════════════════════════════════════
+-- MAIN DETECTION LOOP
+-- ══════════════════════════════════════════
+RunService.Heartbeat:Connect(function()
+    if not char or not hrp or not humanoid then return end
+    if humanoid.Health <= 0 then return end
+
+    local pos = hrp.Position
+    local hpPct = (humanoid.Health/humanoid.MaxHealth)*100
+
+    -- ── SAFE MODE HP LOGIC ──
+    if isSafeMode then
+        if hpPct >= CFG.safeReturnHP then
+            -- Healthy enough — return to enemy
+            local en = findTarget()
+            if en and not safeCD then
+                isSafeMode = false
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                -- Teleport next to enemy
+                local offset = (hrp.Position - en.Position).Unit
+                if offset.Magnitude < 0.1 then offset = Vector3.new(1,0,0) end
+                hrp.CFrame = CFrame.new(en.Position + Vector3.new(offset.X,0,offset.Z)*4 + Vector3.new(0,3,0))
+                if _statusUpdateFn then _statusUpdateFn("returned", killZoneSaves) end
+            end
+        elseif hpPct < CFG.safeTriggerHP and not safeCD then
+            -- Still low — keep us on platform
+            if pos.Y < CFG.safeY - 5 then
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.CFrame = CFrame.new(0, CFG.safeY+7, 0)
+            end
+        end
+        return -- Don't run other checks while in safe mode
+    end
+
+    -- ── LOW HP — go safe ──
+    if safeSettings.autoSafe and hpPct <= CFG.lowHPTrigger and not safeCD then
+        goSafe("lowhp") return
+    end
+
+    -- ── VOID / EDGE ──
+    if safeSettings.antiVoid then
+        if pos.Y < 0 and not safeCD then goSafe("void") return end
+        if (math.abs(pos.X) > CFG.edgeLimit or math.abs(pos.Z) > CFG.edgeLimit) and not safeCD then
+            goSafe("edge") return
+        end
+    end
+
+    -- ── PROXIMITY AUTO-SNAP ──
+    if safeSettings.autoProximity and active and hpPct >= CFG.safeTriggerHP then
+        local en = findTarget()
+        if en then
+            local dist = (en.Position - hrp.Position).Magnitude
+            if dist > CFG.proximityRange then
+                -- Too far — snap back to enemy
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                local angle = math.random() * math.pi * 2
+                local snapOffset = Vector3.new(math.cos(angle)*4, 3, math.sin(angle)*4)
+                hrp.CFrame = CFrame.new(en.Position + snapOffset)
+            end
+        end
+    end
+end)
+
+-- Death
+humanoid.Died:Connect(function()
+    if safeSettings.deathInvis then makeInvisible() end
+end)
+
+createPlatform()
+
+-- ══════════════════════════════════════════
+-- HIT INDICATORS
+-- ══════════════════════════════════════════
+local hitGui = Instance.new("ScreenGui")
+hitGui.Name="HitFX" hitGui.ResetOnSpawn=false
+hitGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+hitGui.Parent=lp:WaitForChild("PlayerGui")
+
+local lastEnemyHP = {}
+local totalDmg = 0
+local hitCombo = 0
+local lastHitTime = 0
+
+-- Screen vignette flash
+local vignette = Instance.new("Frame")
+vignette.Size=UDim2.new(1,0,1,0)
+vignette.BackgroundColor3=Color3.fromRGB(255,20,20)
+vignette.BackgroundTransparency=1 vignette.BorderSizePixel=0
+vignette.ZIndex=100 vignette.Parent=hitGui
+
+-- Combo counter
+local comboHolder = Instance.new("Frame")
+comboHolder.Size=UDim2.new(0,120,0,70)
+comboHolder.Position=UDim2.new(0.5,-60,0.6,0)
+comboHolder.BackgroundTransparency=1 comboHolder.Visible=false
+comboHolder.ZIndex=90 comboHolder.Parent=hitGui
+
+local comboNum = Instance.new("TextLabel")
+comboNum.Size=UDim2.new(1,0,0,46) comboNum.BackgroundTransparency=1
+comboNum.Text="0" comboNum.TextColor3=Color3.fromRGB(255,35,35)
+comboNum.Font=Enum.Font.GothamBold comboNum.TextSize=46
+comboNum.TextStrokeTransparency=0.15
+comboNum.TextStrokeColor3=Color3.fromRGB(0,0,0)
+comboNum.ZIndex=90 comboNum.Parent=comboHolder
+
+local comboSub = Instance.new("TextLabel")
+comboSub.Size=UDim2.new(1,0,0,20) comboSub.Position=UDim2.new(0,0,0,46)
+comboSub.BackgroundTransparency=1 comboSub.Text="HIT COMBO"
+comboSub.TextColor3=Color3.fromRGB(200,200,200)
+comboSub.Font=Enum.Font.GothamBold comboSub.TextSize=11
+comboSub.TextStrokeTransparency=0.3
+comboSub.ZIndex=90 comboSub.Parent=comboHolder
+
+local function spawnDmgNum(amount, worldPos)
+    local sp,onScreen = camera:WorldToViewportPoint(worldPos+Vector3.new(0,2.5,0))
+    if not onScreen or sp.Z<=0 then return end
+    local lbl = Instance.new("TextLabel")
+    lbl.Size=UDim2.new(0,120,0,44)
+    lbl.AnchorPoint=Vector2.new(0.5,0.5)
+    lbl.Position=UDim2.new(0,sp.X,0,sp.Y)
+    lbl.BackgroundTransparency=1
+    lbl.Font=Enum.Font.GothamBold
+    lbl.TextStrokeTransparency=0.1
+    lbl.TextStrokeColor3=Color3.fromRGB(60,0,0)
+    lbl.ZIndex=95
+    local baseSize
+    if amount >= 25 then
+        lbl.Text="💥 -"..math.floor(amount)
+        lbl.TextColor3=Color3.fromRGB(255,20,20) baseSize=34
+    elseif amount >= 15 then
+        lbl.Text="-"..math.floor(amount)
+        lbl.TextColor3=Color3.fromRGB(255,100,20) baseSize=26
+    elseif amount >= 8 then
+        lbl.Text="-"..math.floor(amount)
+        lbl.TextColor3=Color3.fromRGB(255,200,40) baseSize=20
+    else
+        lbl.Text="-"..math.floor(amount)
+        lbl.TextColor3=Color3.fromRGB(240,240,240) baseSize=15
+    end
+    lbl.TextSize = baseSize * 0.5
+    lbl.Parent = hitGui
+    -- Pop in
+    TweenService:Create(lbl,TweenInfo.new(0.12,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{TextSize=baseSize}):Play()
+    task.delay(0.12,function()
+        TweenService:Create(lbl,TweenInfo.new(0.65,Enum.EasingStyle.Quint),{
+            Position=UDim2.new(0,sp.X+math.random(-25,25),0,sp.Y-90),
+            TextTransparency=1, TextStrokeTransparency=1,
+        }):Play()
+        task.delay(0.65,function() lbl:Destroy() end)
+    end)
+end
+
+local function onHit(amount, worldPos)
+    hitCombo += 1
+    totalDmg += amount
+    lastHitTime = tick()
+    -- Screen flash
+    vignette.BackgroundTransparency = 0.84
+    TweenService:Create(vignette,TweenInfo.new(0.2),{BackgroundTransparency=1}):Play()
+    spawnDmgNum(amount, worldPos)
+    -- Combo update
+    comboHolder.Visible = true
+    comboNum.Text = tostring(hitCombo)
+    local col = hitCombo>=15 and Color3.fromRGB(255,0,220)
+        or hitCombo>=8 and Color3.fromRGB(255,80,0)
+        or Color3.fromRGB(255,35,35)
+    comboNum.TextColor3 = col
+    -- Punch animation on number
+    comboNum.TextSize = 58
+    TweenService:Create(comboNum,TweenInfo.new(0.14,Enum.EasingStyle.Back),{TextSize=46}):Play()
+end
+
+RunService.Heartbeat:Connect(function()
+    -- Combo decay
+    if hitCombo > 0 and (tick()-lastHitTime) > 2.5 then
+        hitCombo = 0
+        TweenService:Create(comboHolder,TweenInfo.new(0.25),{}):Play()
+        task.delay(0.25,function() comboHolder.Visible=false end)
+    end
+    -- Watch enemies
+    if not active then return end
+    for _, part in pairs(workspace.Live:GetChildren()) do
+        if part:IsA("Model") and part ~= char then
+            local h = part:FindFirstChildOfClass("Humanoid")
+            local r = part:FindFirstChild("HumanoidRootPart")
+            if h and r and h.Health > 0 then
+                local id = tostring(part)
+                local prev = lastEnemyHP[id] or h.Health
+                local diff = prev - h.Health
+                if diff > 0.5 and (r.Position-hrp.Position).Magnitude < 60 then
+                    onHit(diff, r.Position)
+                end
+                lastEnemyHP[id] = h.Health
+            end
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════
+-- CROSSHAIR
+-- ══════════════════════════════════════════
+local lockGui = Instance.new("ScreenGui")
+lockGui.Name="LockOnGui" lockGui.ResetOnSpawn=false
+lockGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+lockGui.Parent=lp:WaitForChild("PlayerGui")
+
+local chF = Instance.new("Frame")
+chF.Size=UDim2.new(0,70,0,70) chF.AnchorPoint=Vector2.new(0.5,0.5)
+chF.BackgroundTransparency=1 chF.Visible=false chF.Parent=lockGui
+
+local function mkC(xS,yS,oX,oY)
+    local h=Instance.new("Frame") h.Size=UDim2.new(0,14,0,2) h.Position=UDim2.new(xS,oX,yS,oY)
+    h.BackgroundColor3=Color3.fromRGB(255,255,255) h.BorderSizePixel=0 h.Parent=chF
+    local v=Instance.new("Frame") v.Size=UDim2.new(0,2,0,14) v.Position=UDim2.new(xS,oX,yS,oY)
+    v.BackgroundColor3=Color3.fromRGB(255,255,255) v.BorderSizePixel=0 v.Parent=chF
+end
+mkC(0,0,0,0) mkC(1,0,-14,0) mkC(0,1,0,-14) mkC(1,1,-14,-14)
+
+local chDot=Instance.new("Frame") chDot.Size=UDim2.new(0,4,0,4) chDot.Position=UDim2.new(0.5,-2,0.5,-2)
+chDot.BackgroundColor3=Color3.fromRGB(255,255,255) chDot.BorderSizePixel=0 chDot.Parent=chF
+Instance.new("UICorner",chDot).CornerRadius=UDim.new(1,0)
+
+local chName=Instance.new("TextLabel") chName.Size=UDim2.new(0,140,0,18)
+chName.Position=UDim2.new(0.5,-70,0,-22) chName.BackgroundTransparency=1
+chName.Text="" chName.TextColor3=Color3.fromRGB(255,255,255)
+chName.Font=Enum.Font.GothamBold chName.TextSize=12 chName.TextStrokeTransparency=0.4
+chName.Parent=chF
+
+local smX,smY=0,0
+RunService.RenderStepped:Connect(function()
+    if not cameraLocked then chF.Visible=false return end
+    local en=findTarget()
+    if not en then chF.Visible=false return end
+    local sp,onS=camera:WorldToViewportPoint(en.Position+Vector3.new(0,2,0))
+    if onS and sp.Z>0 then
+        chF.Visible=true
+        smX+=(sp.X-smX)*0.25 smY+=(sp.Y-smY)*0.25
+        chF.Position=UDim2.new(0,smX,0,smY)
+        local dist=(en.Position-hrp.Position).Magnitude
+        local size=math.clamp(80-dist*0.3,46,80)
+        chF.Size=UDim2.new(0,size,0,size)
+        local col=dist<10 and Color3.fromRGB(255,60,60) or dist<25 and Color3.fromRGB(255,210,0) or Color3.fromRGB(255,255,255)
+        for _,v in ipairs(chF:GetDescendants()) do if v:IsA("Frame") then v.BackgroundColor3=col end end
+        local dn=en.Parent.Name
+        for _,pl in ipairs(game.Players:GetPlayers()) do if pl.Character==en.Parent then dn=pl.DisplayName break end end
+        chName.Text=dn chName.TextColor3=col
+    else chF.Visible=false end
+end)
+
+-- ══════════════════════════════════════════
+-- REWORKED GUI
+-- ══════════════════════════════════════════
+local gui = Instance.new("ScreenGui")
+gui.Name="HBGui" gui.ResetOnSpawn=false
+gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+gui.Parent=lp:WaitForChild("PlayerGui")
+
+-- Color palette
+local C = {
+    bg      = Color3.fromRGB(8,8,10),
+    card    = Color3.fromRGB(16,16,20),
+    card2   = Color3.fromRGB(22,22,28),
+    border  = Color3.fromRGB(32,32,42),
+    red     = Color3.fromRGB(220,38,38),
+    redDark = Color3.fromRGB(120,20,20),
+    green   = Color3.fromRGB(34,197,94),
+    blue    = Color3.fromRGB(59,130,246),
+    purple  = Color3.fromRGB(147,51,234),
+    orange  = Color3.fromRGB(249,115,22),
+    text    = Color3.fromRGB(220,220,228),
+    dim     = Color3.fromRGB(90,90,105),
+    white   = Color3.fromRGB(255,255,255),
+}
+
+-- ── PILL TOGGLE BUTTON (fixed, not draggable) ──
+local pillBtn = Instance.new("Frame")
+pillBtn.Size = UDim2.new(0,54,0,26)
+pillBtn.Position = UDim2.new(0,8,0.5,-13)
+pillBtn.BackgroundColor3 = C.card
+pillBtn.BorderSizePixel = 0
+pillBtn.Active = true
+pillBtn.ZIndex = 10
+pillBtn.Parent = gui
+Instance.new("UICorner",pillBtn).CornerRadius = UDim.new(1,0)
+Instance.new("UIStroke",pillBtn).Color = C.border
+
+local pillKnob = Instance.new("Frame")
+pillKnob.Size = UDim2.new(0,20,0,20)
+pillKnob.Position = UDim2.new(0,3,0.5,-10)
+pillKnob.BackgroundColor3 = C.dim
+pillKnob.BorderSizePixel = 0
+pillKnob.ZIndex = 11
+pillKnob.Parent = pillBtn
+Instance.new("UICorner",pillKnob).CornerRadius = UDim.new(1,0)
+
+local pillIcon = Instance.new("TextLabel")
+pillIcon.Size = UDim2.new(0,20,0,20)
+pillIcon.BackgroundTransparency = 1
+pillIcon.Text = "🎯"
+pillIcon.TextSize = 11
+pillIcon.Font = Enum.Font.GothamBold
+pillIcon.ZIndex = 12
+pillIcon.Parent = pillKnob
+
+-- Status dot
+local sDot = Instance.new("Frame")
+sDot.Size = UDim2.new(0,7,0,7)
+sDot.Position = UDim2.new(1,-9,0,2)
+sDot.BackgroundColor3 = C.dim
+sDot.BorderSizePixel = 0
+sDot.ZIndex = 13
+sDot.Parent = pillBtn
+Instance.new("UICorner",sDot).CornerRadius = UDim.new(1,0)
+
+-- ── MAIN PANEL ──
+local panel = Instance.new("Frame")
+panel.Size = UDim2.new(0,220,0,44)
+panel.Position = UDim2.new(0,70,0.5,-22)
+panel.BackgroundColor3 = C.bg
+panel.BorderSizePixel = 0
+panel.Active = true
+panel.Visible = false
+panel.ClipsDescendants = true
+panel.ZIndex = 10
+panel.Parent = gui
+Instance.new("UICorner",panel).CornerRadius = UDim.new(0,12)
+Instance.new("UIStroke",panel).Color = C.border
+
+-- Drag panel
+local dr,ds,sp2 = false,nil,nil
+panel.InputBegan:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then
+        dr=true ds=i.Position sp2=panel.Position
+    end
+end)
+panel.InputChanged:Connect(function(i)
+    if dr and (i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseMove) then
+        local d=i.Position-ds
+        panel.Position=UDim2.new(sp2.X.Scale,sp2.X.Offset+d.X,sp2.Y.Scale,sp2.Y.Offset+d.Y)
+    end
+end)
+panel.InputEnded:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then dr=false end
+end)
+
+-- Panel toggle
+local panelOpen = false
+local pillClickBtn = Instance.new("TextButton")
+pillClickBtn.Size=UDim2.new(1,0,1,0) pillClickBtn.BackgroundTransparency=1
+pillClickBtn.Text="" pillClickBtn.ZIndex=14 pillClickBtn.Parent=pillBtn
+pillClickBtn.MouseButton1Click:Connect(function()
+    panelOpen=not panelOpen
+    if panelOpen then
+        panel.Visible=true panel.Size=UDim2.new(0,0,0,44)
+        TweenService:Create(panel,TweenInfo.new(0.18,Enum.EasingStyle.Quint),{Size=UDim2.new(0,220,0,44)}):Play()
+        TweenService:Create(pillBtn,TweenInfo.new(0.12),{BackgroundColor3=C.card2}):Play()
+    else
+        TweenService:Create(panel,TweenInfo.new(0.15,Enum.EasingStyle.Quint),{Size=UDim2.new(0,0,0,44)}):Play()
+        TweenService:Create(pillBtn,TweenInfo.new(0.12),{BackgroundColor3=C.card}):Play()
+        task.delay(0.15,function() if not panelOpen then panel.Visible=false end end)
+    end
+end)
+
+-- Header bar
+local bar = Instance.new("Frame")
+bar.Size=UDim2.new(1,0,0,44) bar.BackgroundTransparency=1 bar.Parent=panel
+
+-- Main ON/OFF pill toggle inside panel
+local mainPill = Instance.new("Frame")
+mainPill.Size=UDim2.new(0,78,0,32) mainPill.Position=UDim2.new(0,6,0.5,-16)
+mainPill.BackgroundColor3=Color3.fromRGB(28,28,35) mainPill.BorderSizePixel=0 mainPill.Parent=bar
+Instance.new("UICorner",mainPill).CornerRadius=UDim.new(0,9)
+Instance.new("UIStroke",mainPill).Color=C.border
+
+local mainPillTxt = Instance.new("TextLabel")
+mainPillTxt.Size=UDim2.new(1,0,1,0) mainPillTxt.BackgroundTransparency=1
+mainPillTxt.Text="OFF" mainPillTxt.TextColor3=C.dim
+mainPillTxt.Font=Enum.Font.GothamBold mainPillTxt.TextSize=11 mainPillTxt.Parent=mainPill
+
+local mainPillBtn = Instance.new("TextButton")
+mainPillBtn.Size=UDim2.new(1,0,1,0) mainPillBtn.BackgroundTransparency=1
+mainPillBtn.Text="" mainPillBtn.Parent=mainPill
+
+-- Cam button
+local camB = Instance.new("TextButton")
+camB.Size=UDim2.new(0,28,0,28) camB.Position=UDim2.new(0,88,0.5,-14)
+camB.BackgroundColor3=Color3.fromRGB(20,20,26) camB.TextColor3=C.dim
+camB.Text="📷" camB.Font=Enum.Font.GothamBold camB.TextSize=13
+camB.BorderSizePixel=0 camB.Parent=bar
+Instance.new("UICorner",camB).CornerRadius=UDim.new(0,7)
+Instance.new("UIStroke",camB).Color=C.border
+
+-- Safe button
+local sfB = Instance.new("TextButton")
+sfB.Size=UDim2.new(0,28,0,28) sfB.Position=UDim2.new(0,120,0.5,-14)
+sfB.BackgroundColor3=Color3.fromRGB(14,18,32) sfB.TextColor3=C.blue
+sfB.Text="🛡" sfB.Font=Enum.Font.GothamBold sfB.TextSize=13
+sfB.BorderSizePixel=0 sfB.Parent=bar
+Instance.new("UICorner",sfB).CornerRadius=UDim.new(0,7)
+Instance.new("UIStroke",sfB).Color=Color3.fromRGB(30,50,100)
+sfB.MouseButton1Click:Connect(function() safeCD=false goSafe("manual") end)
+
+-- Status text
+local stTxt = Instance.new("TextLabel")
+stTxt.Size=UDim2.new(0,44,1,0) stTxt.Position=UDim2.new(0,152,0,0)
+stTxt.BackgroundTransparency=1 stTxt.Text="Idle"
+stTxt.TextColor3=C.dim stTxt.Font=Enum.Font.GothamBold
+stTxt.TextSize=8 stTxt.TextWrapped=true
+stTxt.TextXAlignment=Enum.TextXAlignment.Left stTxt.Parent=bar
+
+-- Expand
+local expBtn = Instance.new("TextButton")
+expBtn.Size=UDim2.new(0,22,0,22) expBtn.Position=UDim2.new(1,-28,0.5,-11)
+expBtn.BackgroundColor3=Color3.fromRGB(18,18,22) expBtn.TextColor3=C.dim
+expBtn.Text="▼" expBtn.Font=Enum.Font.GothamBold expBtn.TextSize=8
+expBtn.BorderSizePixel=0 expBtn.Parent=bar
+Instance.new("UICorner",expBtn).CornerRadius=UDim.new(0,5)
+
+-- ── EXPANDED PANEL ──
+local exp = Instance.new("Frame")
+exp.Size=UDim2.new(1,0,0,290) exp.Position=UDim2.new(0,0,0,44)
+exp.BackgroundTransparency=1 exp.Visible=false exp.Parent=panel
+
+local expSc = Instance.new("ScrollingFrame")
+expSc.Size=UDim2.new(1,0,1,0) expSc.BackgroundTransparency=1
+expSc.BorderSizePixel=0 expSc.ScrollBarThickness=2
+expSc.ScrollBarImageColor3=C.border
+expSc.CanvasSize=UDim2.new(0,0,0,0) expSc.AutomaticCanvasSize=Enum.AutomaticSize.Y
+expSc.Parent=exp
+local exL=Instance.new("UIListLayout") exL.Padding=UDim.new(0,4) exL.Parent=expSc
+local exP=Instance.new("UIPadding") exP.PaddingTop=UDim.new(0,4) exP.PaddingLeft=UDim.new(0,5)
+exP.PaddingRight=UDim.new(0,5) exP.PaddingBottom=UDim.new(0,5) exP.Parent=expSc
+
+-- Stats cards
+local function makeStatCard(iconTxt, labelTxt, valCol)
+    local f=Instance.new("Frame") f.Size=UDim2.new(1,0,0,24)
+    f.BackgroundColor3=C.card f.BorderSizePixel=0 f.Parent=expSc
+    Instance.new("UICorner",f).CornerRadius=UDim.new(0,6)
+    local ico=Instance.new("TextLabel") ico.Size=UDim2.new(0,22,1,0)
+    ico.BackgroundTransparency=1 ico.Text=iconTxt
+    ico.Font=Enum.Font.GothamBold ico.TextSize=11
+    ico.TextColor3=C.dim ico.Parent=f
+    local lbl=Instance.new("TextLabel") lbl.Size=UDim2.new(0.5,0,1,0) lbl.Position=UDim2.new(0,20,0,0)
+    lbl.BackgroundTransparency=1 lbl.Text=labelTxt lbl.TextColor3=C.dim
+    lbl.Font=Enum.Font.Gotham lbl.TextSize=9 lbl.TextXAlignment=Enum.TextXAlignment.Left lbl.Parent=f
+    local val=Instance.new("TextLabel") val.Size=UDim2.new(0.45,-4,1,0) val.Position=UDim2.new(0.55,0,0,0)
+    val.BackgroundTransparency=1 val.Text="—" val.TextColor3=valCol or C.text
+    val.Font=Enum.Font.GothamBold val.TextSize=9 val.TextXAlignment=Enum.TextXAlignment.Right val.Parent=f
+    return val
+end
+
+local _,hitsVal   = makeStatCard("⚡","Hits")
+local _,dmgVal    = makeStatCard("💥","Damage",C.red)
+local _,distVal   = makeStatCard("📍","Distance",C.blue)
+local _,safeVal   = makeStatCard("🛡","Safe",C.blue)
+local _,savesVal  = makeStatCard("⚠️","Saves left",C.orange)
+local _,proximVal = makeStatCard("🎯","Proximity",C.green)
+
+-- Divider
+local div=Instance.new("Frame") div.Size=UDim2.new(1,0,0,1)
+div.BackgroundColor3=C.border div.BorderSizePixel=0 div.Parent=expSc
+
+-- Section label
+local function secLabel(txt)
+    local f=Instance.new("TextLabel") f.Size=UDim2.new(1,0,0,14)
+    f.BackgroundTransparency=1 f.Text=txt f.TextColor3=C.dim
+    f.Font=Enum.Font.GothamBold f.TextSize=8
+    f.TextXAlignment=Enum.TextXAlignment.Left f.Parent=expSc
+end
+
+secLabel("SAFE GUARD")
+
+-- Mini toggles
+local function mkTog(title, getter, setter)
+    local f=Instance.new("Frame") f.Size=UDim2.new(1,0,0,26)
+    f.BackgroundColor3=C.card f.BorderSizePixel=0 f.Parent=expSc
+    Instance.new("UICorner",f).CornerRadius=UDim.new(0,6)
+    local t=Instance.new("TextLabel") t.Size=UDim2.new(0.72,0,1,0) t.Position=UDim2.new(0,7,0,0)
+    t.BackgroundTransparency=1 t.Text=title t.TextColor3=C.dim
+    t.Font=Enum.Font.Gotham t.TextSize=9 t.TextXAlignment=Enum.TextXAlignment.Left t.Parent=f
+    local pill=Instance.new("Frame") pill.Size=UDim2.new(0,32,0,16) pill.Position=UDim2.new(1,-38,0.5,-8)
+    pill.BackgroundColor3=getter() and C.green or C.border pill.BorderSizePixel=0 pill.Parent=f
+    Instance.new("UICorner",pill).CornerRadius=UDim.new(1,0)
+    local knob=Instance.new("Frame") knob.Size=UDim2.new(0,11,0,11)
+    knob.Position=getter() and UDim2.new(0,18,0.5,-5) or UDim2.new(0,3,0.5,-5)
+    knob.BackgroundColor3=C.white knob.BorderSizePixel=0 knob.Parent=pill
+    Instance.new("UICorner",knob).CornerRadius=UDim.new(1,0)
+    local btn=Instance.new("TextButton") btn.Size=UDim2.new(1,0,1,0)
+    btn.BackgroundTransparency=1 btn.Text="" btn.Parent=f
+    btn.MouseButton1Click:Connect(function()
+        local v=not getter() setter(v)
+        TweenService:Create(pill,TweenInfo.new(0.12),{BackgroundColor3=v and C.green or C.border}):Play()
+        TweenService:Create(knob,TweenInfo.new(0.12),{Position=v and UDim2.new(0,18,0.5,-5) or UDim2.new(0,3,0.5,-5)}):Play()
+    end)
+end
+
+mkTog("Auto Safe on Low HP", function() return safeSettings.autoSafe end, function(v) safeSettings.autoSafe=v end)
+mkTog("Anti Void / Edge", function() return safeSettings.antiVoid end, function(v) safeSettings.antiVoid=v end)
+mkTog("Death Invisibility", function() return safeSettings.deathInvis end, function(v) safeSettings.deathInvis=v end)
+mkTog("Auto Proximity Snap", function() return safeSettings.autoProximity end, function(v) safeSettings.autoProximity=v end)
+
+-- Restore vis
+local rvBtn=Instance.new("TextButton") rvBtn.Size=UDim2.new(1,0,0,24)
+rvBtn.BackgroundColor3=Color3.fromRGB(14,10,26) rvBtn.TextColor3=C.purple
+rvBtn.Text="👁 Restore Visibility" rvBtn.Font=Enum.Font.GothamBold
+rvBtn.TextSize=9 rvBtn.BorderSizePixel=0 rvBtn.Parent=expSc
+Instance.new("UICorner",rvBtn).CornerRadius=UDim.new(0,6)
+Instance.new("UIStroke",rvBtn).Color=C.purple
+rvBtn.MouseButton1Click:Connect(function()
+    makeVisible() rvBtn.Text="✅ Done!"
+    task.delay(1.5,function() rvBtn.Text="👁 Restore Visibility" end)
+end)
+
+-- Reset saves counter
+local rsBtn=Instance.new("TextButton") rsBtn.Size=UDim2.new(1,0,0,24)
+rsBtn.BackgroundColor3=Color3.fromRGB(20,12,8) rsBtn.TextColor3=C.orange
+rsBtn.Text="🔄 Reset Kill Zone Counter" rsBtn.Font=Enum.Font.GothamBold
+rsBtn.TextSize=9 rsBtn.BorderSizePixel=0 rsBtn.Parent=expSc
+Instance.new("UICorner",rsBtn).CornerRadius=UDim.new(0,6)
+Instance.new("UIStroke",rsBtn).Color=C.orange
+rsBtn.MouseButton1Click:Connect(function()
+    killZoneSaves=0 rsBtn.Text="✅ Reset!"
+    task.delay(1.5,function() rsBtn.Text="🔄 Reset Kill Zone Counter" end)
+end)
+
+secLabel("LOCK TARGET")
+
+-- Player list
+local plScroll=Instance.new("ScrollingFrame") plScroll.Size=UDim2.new(1,0,0,54)
+plScroll.BackgroundColor3=Color3.fromRGB(10,10,13) plScroll.BorderSizePixel=0
+plScroll.ScrollBarThickness=2 plScroll.ScrollBarImageColor3=C.border
+plScroll.CanvasSize=UDim2.new(0,0,0,0) plScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y
+plScroll.Parent=expSc
+Instance.new("UICorner",plScroll).CornerRadius=UDim.new(0,6)
+local plL=Instance.new("UIListLayout") plL.Padding=UDim.new(0,2) plL.Parent=plScroll
+local plP=Instance.new("UIPadding") plP.PaddingTop=UDim.new(0,2) plP.PaddingLeft=UDim.new(0,3)
+plP.PaddingRight=UDim.new(0,3) plP.Parent=plScroll
+
+local clrBtn=Instance.new("TextButton") clrBtn.Size=UDim2.new(1,0,0,22)
+clrBtn.BackgroundColor3=Color3.fromRGB(14,14,18) clrBtn.TextColor3=C.dim
+clrBtn.Text="🔓 Clear Lock" clrBtn.Font=Enum.Font.GothamBold
+clrBtn.TextSize=8 clrBtn.BorderSizePixel=0 clrBtn.Parent=expSc
+Instance.new("UICorner",clrBtn).CornerRadius=UDim.new(0,6)
+Instance.new("UIStroke",clrBtn).Color=C.border
+
+local isExpanded = false
+expBtn.MouseButton1Click:Connect(function()
+    isExpanded=not isExpanded
+    if isExpanded then
+        exp.Visible=true expBtn.Text="▲"
+        TweenService:Create(panel,TweenInfo.new(0.22,Enum.EasingStyle.Quint),{Size=UDim2.new(0,220,0,344)}):Play()
+    else
+        expBtn.Text="▼"
+        TweenService:Create(panel,TweenInfo.new(0.2,Enum.EasingStyle.Quint),{Size=UDim2.new(0,220,0,44)}):Play()
+        task.delay(0.2,function() exp.Visible=false end)
+    end
+end)
+
+-- Status update callback
+local hitCount = 0
+local lastHealth = {}
+
+_statusUpdateFn = function(reason, saves)
+    local msgs = {
+        lowhp="⚡ Low HP",void="🌀 Void",edge="⚠️ Edge",
+        death="💀 Dead",manual="🛡 Safe",monitoring="✅ OK",returned="↩ Back"
+    }
+    stTxt.Text = msgs[reason] or reason
+    local cols = {
+        lowhp=C.red,void=C.blue,edge=C.orange,death=C.purple,
+        manual=C.blue,monitoring=C.green,returned=C.green
+    }
+    stTxt.TextColor3 = cols[reason] or C.dim
+end
+
+-- ON/OFF
+mainPillBtn.MouseButton1Click:Connect(function()
+    active=not active
+    if active then
+        hitCount=0 totalDmg=0 hitCombo=0
+        lastHP=humanoid.Health
+        mainPillTxt.Text="ON" mainPillTxt.TextColor3=C.green
+        mainPill.BackgroundColor3=Color3.fromRGB(10,32,18)
+        TweenService:Create(pillKnob,TweenInfo.new(0.15),{BackgroundColor3=C.green}):Play()
+        TweenService:Create(pillBtn,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(10,32,18)}):Play()
+        stTxt.Text="Active" stTxt.TextColor3=C.green
+        task.spawn(startHitbox)
+    else
+        stopHitbox()
+        mainPillTxt.Text="OFF" mainPillTxt.TextColor3=C.dim
+        mainPill.BackgroundColor3=Color3.fromRGB(28,28,35)
+        TweenService:Create(pillKnob,TweenInfo.new(0.15),{BackgroundColor3=C.dim}):Play()
+        TweenService:Create(pillBtn,TweenInfo.new(0.15),{BackgroundColor3=C.card}):Play()
+        stTxt.Text="Idle" stTxt.TextColor3=C.dim
+        lastEnemyHP={}
+    end
+end)
+
+camB.MouseButton1Click:Connect(function()
+    cameraLocked=not cameraLocked
+    if cameraLocked then
+        camB.BackgroundColor3=Color3.fromRGB(14,28,58) camB.Text="🔒"
+        TweenService:Create(camB,TweenInfo.new(0.1),{BackgroundColor3=Color3.fromRGB(14,28,58)}):Play()
+    else
+        camB.BackgroundColor3=Color3.fromRGB(20,20,26) camB.Text="📷"
+        chF.Visible=false
+    end
+end)
+
+local function refreshList()
+    for _,v in ipairs(plScroll:GetChildren()) do if v:IsA("TextButton") then v:Destroy() end end
+    local any=false
+    for _,p in ipairs(game.Players:GetPlayers()) do
+        if p~=lp then
+            any=true
+            local b=Instance.new("TextButton")
+            b.Size=UDim2.new(1,0,0,22) b.BackgroundColor3=Color3.fromRGB(16,16,20)
+            b.TextColor3=C.dim b.Text="  👤 "..p.DisplayName
+            b.Font=Enum.Font.GothamBold b.TextSize=9 b.BorderSizePixel=0
+            b.TextXAlignment=Enum.TextXAlignment.Left b.Name=p.DisplayName b.Parent=plScroll
+            Instance.new("UICorner",b).CornerRadius=UDim.new(0,5)
+            b.MouseButton1Click:Connect(function()
+                for _,x in ipairs(plScroll:GetChildren()) do
+                    if x:IsA("TextButton") then x.BackgroundColor3=Color3.fromRGB(16,16,20) x.TextColor3=C.dim end
+                end
+                if p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                    getgenv().lockedTarget=p.Character.HumanoidRootPart
+                    b.BackgroundColor3=Color3.fromRGB(8,28,16) b.TextColor3=C.green
+                    b.Text="  🔒 "..p.DisplayName
+                    stTxt.Text="🔒 "..p.DisplayName stTxt.TextColor3=C.green
+                end
+            end)
+        end
+    end
+    if not any then
+        local l=Instance.new("TextLabel") l.Size=UDim2.new(1,0,0,22)
+        l.BackgroundTransparency=1 l.Text="  No players" l.TextColor3=C.dim
+        l.Font=Enum.Font.Gotham l.TextSize=9 l.Parent=plScroll
+    end
+end
+
+clrBtn.MouseButton1Click:Connect(function()
+    getgenv().lockedTarget=nil
+    stTxt.Text="Auto" stTxt.TextColor3=C.dim refreshList()
+end)
+
+refreshList()
+game.Players.PlayerAdded:Connect(function() task.wait(0.5) refreshList() end)
+game.Players.PlayerRemoving:Connect(function(p)
+    task.wait(0.1)
+    if getgenv().lockedTarget and getgenv().lockedTarget.Parent
+    and getgenv().lockedTarget.Parent.Name==p.Name then
+        getgenv().lockedTarget=nil stTxt.Text="Auto"
+    end
+    refreshList()
+end)
+
+-- Live stat updates
+RunService.Heartbeat:Connect(function()
+    if not humanoid then return end
+    local hpPct=(humanoid.Health/humanoid.MaxHealth)*100
+
+    -- Pill knob color
+    sDot.BackgroundColor3 = isSafeMode and C.orange
+        or isInvis and C.purple
+        or active and C.green
+        or hpPct<=10 and C.red
+        or C.dim
+
+    if not active then return end
+
+    local en = findTarget()
+    if en then
+        local dist=math.floor((en.Position-hrp.Position).Magnitude)
+        distVal.Text=dist.." st"
+        distVal.TextColor3=dist<10 and C.red or dist<25 and C.orange or C.blue
+
+        local dn=en.Parent.Name
+        for _,p in ipairs(game.Players:GetPlayers()) do if p.Character==en.Parent then dn=p.DisplayName break end end
+        if not getgenv().lockedTarget then stTxt.Text="🎯 "..dn stTxt.TextColor3=C.green end
+
+        for _,p in ipairs(game.Players:GetPlayers()) do
+            if p~=lp and p.Character then
+                local h=p.Character:FindFirstChildOfClass("Humanoid")
+                if h then
+                    local prev=lastHealth[p.Name] or h.Health
+                    if h.Health<prev then
+                        hitCount+=1 hitsVal.Text=tostring(hitCount)
+                    end
+                    lastHealth[p.Name]=h.Health
+                end
+            end
+        end
+    else
+        distVal.Text="—" distVal.TextColor3=C.dim
+        if not getgenv().lockedTarget then stTxt.Text="Scan" stTxt.TextColor3=C.dim end
+    end
+
+    dmgVal.Text=math.floor(totalDmg)
+    safeVal.Text=isSafeMode and "ACTIVE" or "Standby"
+    safeVal.TextColor3=isSafeMode and C.orange or C.dim
+    savesVal.Text=(CFG.killZoneLimit-killZoneSaves).." left"
+    savesVal.TextColor3=killZoneSaves>=CFG.killZoneLimit and C.red or C.orange
+    proximVal.Text=safeSettings.autoProximity and "ON" or "OFF"
+    proximVal.TextColor3=safeSettings.autoProximity and C.green or C.dim
+end)
+
+-- Respawn
+lp.CharacterAdded:Connect(function(c)
+    char=c hrp=c:WaitForChild("HumanoidRootPart")
+    humanoid=c:WaitForChild("Humanoid")
+    getgenv().ATCH=false getgenv().lockedTarget=nil
+    cameraLocked=false hitCount=0
+    lastHP=humanoid.Health damagedUntil=0
+    isSafeMode=false safeCD=false isInvis=false
+    originalSizes={} lastEnemyHP={} totalDmg=0 hitCombo=0
+    posHistory={} timeHistory={}
+    camB.BackgroundColor3=Color3.fromRGB(20,20,26) camB.Text="📷"
+    chF.Visible=false stTxt.Text="Idle" stTxt.TextColor3=C.dim
+    task.delay(0.5,createPlatform)
+    humanoid.Died:Connect(function()
+        if safeSettings.deathInvis then makeInvisible() end
+    end)
+    refreshList()
+    if active then task.wait(1) task.spawn(startHitbox) end
+end)
