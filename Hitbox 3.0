@@ -1,0 +1,1103 @@
+-- ╔══════════════════════════════════════════════════════╗
+-- ║           NEXUS HITBOX  ·  UNIFIED SCRIPT            ║
+-- ║  Hitbox · SafeGuard · AntiFling · Proximity · UI     ║
+-- ╚══════════════════════════════════════════════════════╝
+
+local lp        = game.Players.LocalPlayer
+local RS        = game:GetService("RunService")
+local UIS       = game:GetService("UserInputService")
+local TS        = game:GetService("TweenService")
+local Players   = game:GetService("Players")
+local Ping      = game:GetService("Stats").PerformanceStats.Ping
+
+local char      = lp.Character or lp.CharacterAdded:Wait()
+local hrp       = char:WaitForChild("HumanoidRootPart")
+local human     = char:WaitForChild("Humanoid")
+local cam       = workspace.CurrentCamera
+
+-- Grace period on spawn
+task.defer(function()
+    local t = tick()
+    repeat task.wait(0.1)
+    until hrp.AssemblyLinearVelocity.Magnitude < 2 or tick()-t > 4
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- CONFIG
+-- ══════════════════════════════════════════════════════════════
+local CFG = {
+    proximityWatch   = 35,    -- if enemy > this, snap back
+    proximityLand    = 5,     -- land this far from enemy
+    safeY            = 5000,  -- sky platform Y
+    edgeLimit        = 490,   -- XZ void boundary
+    voidY            = -80,   -- real TSB void floor
+    antiFlingThresh  = 600,   -- velocity spike = hacker fling
+    killZoneMax      = 10,    -- saves before giving up
+    lowHPPct         = 12,    -- % to trigger safe
+    safeReturnPct    = 52,    -- % to return from safe
+    skyFlingY        = 2000,  -- shot above this by hacker = fling
+}
+
+-- ══════════════════════════════════════════════════════════════
+-- STATE
+-- ══════════════════════════════════════════════════════════════
+local ST = {
+    active         = false,
+    camLocked      = false,
+    isSafe         = false,
+    safeCD         = false,
+    isInvis        = false,
+    flung          = false,
+    skillActive    = false,   -- true when WE fire a skill/M1
+    skillUntil     = 0,       -- tick when skill immunity expires
+    killSaves      = 0,
+    originalSizes  = {},
+    hitCount       = 0,
+    totalDmg       = 0,
+    hitCombo       = 0,
+    lastHitTime    = 0,
+    lastEnemyHP    = {},
+    lastHPVal      = human.Health,
+    damagedUntil   = 0,
+    posHist        = {},
+    timeHist       = {},
+    cachedEnemy    = nil,
+    safePlatform   = nil,
+}
+
+getgenv().ATCH         = false
+getgenv().EN           = nil
+getgenv().connections  = {}
+getgenv().lockedTarget = nil
+
+local HIST = 6
+
+-- ══════════════════════════════════════════════════════════════
+-- ENEMY CACHE
+-- ══════════════════════════════════════════════════════════════
+RS.Heartbeat:Connect(function()
+    local best, near = math.huge, nil
+    for _, m in pairs(workspace.Live:GetChildren()) do
+        if m:IsA("Model") and m ~= char then
+            local h = m:FindFirstChildOfClass("Humanoid")
+            local r = m:FindFirstChild("HumanoidRootPart")
+            if h and r and h.Health > 0 then
+                local d = (r.Position - hrp.Position).Magnitude
+                if d < best then best=d near={m=m,r=r,d=d,h=h} end
+            end
+        end
+    end
+    ST.cachedEnemy = near
+end)
+
+local function findTarget()
+    if getgenv().lockedTarget then
+        local t = getgenv().lockedTarget
+        if t and t.Parent then
+            local h = t.Parent:FindFirstChildOfClass("Humanoid")
+            if h and h.Health > 0 then return t end
+        end
+        getgenv().lockedTarget = nil
+    end
+    return ST.cachedEnemy and ST.cachedEnemy.r or nil
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- PREDICTION
+-- ══════════════════════════════════════════════════════════════
+local function pushHist(name, pos)
+    if not ST.posHist[name] then ST.posHist[name]={} ST.timeHist[name]={} end
+    local ph, th = ST.posHist[name], ST.timeHist[name]
+    table.insert(ph,pos) table.insert(th,tick())
+    if #ph > HIST then table.remove(ph,1) table.remove(th,1) end
+end
+
+local function getVelAccel(name)
+    local ph, th = ST.posHist[name], ST.timeHist[name]
+    if not ph or #ph < 3 then return Vector3.zero, Vector3.zero end
+    local tv, tw = Vector3.zero, 0
+    for i = 2, #ph do
+        local dt = th[i]-th[i-1]
+        if dt>0 and dt<0.15 then
+            local w=i*i tv+=((ph[i]-ph[i-1])/dt)*w tw+=w
+        end
+    end
+    local vel = tw>0 and tv/tw or Vector3.zero
+    local acc = Vector3.zero
+    local n = #ph
+    local dt1,dt2 = th[n-1]-th[n-2], th[n]-th[n-1]
+    if dt1>0 and dt2>0 then
+        acc = ((ph[n]-ph[n-1])/dt2 - (ph[n-1]-ph[n-2])/dt1)/dt2
+    end
+    return vel, acc
+end
+
+local function predPos(en)
+    local name = tostring(en)
+    local vel,acc = getVelAccel(name)
+    local xzSpd = math.sqrt(vel.X^2+vel.Z^2)
+    local pt = xzSpd>40 and .1 or xzSpd>25 and .0625 or xzSpd>10 and .042 or xzSpd>3 and .029 or 0
+    local px = en.Position.X + vel.X*pt + .5*acc.X*pt*pt
+    local pz = en.Position.Z + vel.Z*pt + .5*acc.Z*pt*pt
+    local dx,dz = px-en.Position.X, pz-en.Position.Z
+    local dm = math.sqrt(dx*dx+dz*dz)
+    if dm>7 then local s=7/dm px=en.Position.X+dx*s pz=en.Position.Z+dz*s end
+    return px, pz
+end
+
+-- Adaptive hitbox Y — matches underground hacker position
+local function getHitboxY(enemyHRP)
+    local ey = enemyHRP.Position.Y
+    if ey < -5 then
+        return ey - 5  -- match their underground Y
+    end
+    return 441 - 9  -- standard hitbox Y
+end
+
+local function isSafeToRestore(cf, enemyUnderground)
+    if enemyUnderground then return true end  -- always restore for underground
+    if cf.Position.Y < 400 then return false end
+    if tick() < ST.damagedUntil then return false end
+    if math.abs(hrp.AssemblyLinearVelocity.Y) > 30 then return false end
+    return true
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- INVISIBILITY
+-- ══════════════════════════════════════════════════════════════
+local function makeInvisible()
+    if ST.isInvis then return end
+    ST.isInvis = true
+    ST.originalSizes = {}
+    pcall(function()
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then
+                ST.originalSizes[p] = p.Size
+                p.Size = Vector3.new(0.001,0.001,0.001)
+            end
+        end
+    end)
+end
+
+local function makeVisible()
+    if not ST.isInvis then return end
+    ST.isInvis = false
+    pcall(function()
+        for part, sz in pairs(ST.originalSizes) do
+            if part and part.Parent then part.Size = sz end
+        end
+    end)
+    ST.originalSizes = {}
+end
+
+local function hideHead()
+    pcall(function()
+        local head = char:FindFirstChild("Head")
+        if head then head.LocalTransparencyModifier = 1 end
+        for _, v in ipairs(char:GetChildren()) do
+            if v:IsA("Accessory") then
+                local h = v:FindFirstChild("Handle")
+                if h then h.LocalTransparencyModifier = 1 end
+            end
+        end
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- SAFE PLATFORM
+-- ══════════════════════════════════════════════════════════════
+local function buildPlatform()
+    if ST.safePlatform then pcall(function() ST.safePlatform:Destroy() end) end
+    local p = Instance.new("Part")
+    p.Size = Vector3.new(80,2,80)
+    p.Position = Vector3.new(0, CFG.safeY, 0)
+    p.Anchored=true p.CanCollide=true p.Locked=true
+    p.BrickColor=BrickColor.new("Really black")
+    p.Material=Enum.Material.SmoothPlastic
+    p.CastShadow=false p.Parent=workspace
+    local sg=Instance.new("SurfaceGui") sg.Face=Enum.NormalId.Top sg.Parent=p
+    local lb=Instance.new("TextLabel")
+    lb.Size=UDim2.new(1,0,1,0) lb.BackgroundTransparency=1
+    lb.Text="NEXUS SAFE" lb.TextColor3=Color3.fromRGB(50,200,120)
+    lb.Font=Enum.Font.GothamBold lb.TextSize=52 lb.Parent=sg
+    ST.safePlatform = p
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- TELEPORT HELPERS
+-- ══════════════════════════════════════════════════════════════
+local function snapToSafe()
+    if not ST.safePlatform or not ST.safePlatform.Parent then buildPlatform() end
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.CFrame = CFrame.new(0, CFG.safeY+7, 0)
+    ST.isSafe = true
+end
+
+local function snapToEnemy()
+    local e = ST.cachedEnemy
+    if not e then return end
+    local angle = math.random() * math.pi * 2
+    local offset = Vector3.new(math.cos(angle)*CFG.proximityLand, 0, math.sin(angle)*CFG.proximityLand)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.CFrame = CFrame.new(e.r.Position + Vector3.new(offset.X, 3, offset.Z))
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- GO SAFE
+-- ══════════════════════════════════════════════════════════════
+local _uiStatus = nil
+
+local function goSafe(reason)
+    if ST.safeCD then return end
+    if reason=="void" or reason=="edge" or reason=="fling" or reason=="sky" then
+        ST.killSaves += 1
+        if ST.killSaves > CFG.killZoneMax then return end
+    end
+    ST.safeCD = true
+    snapToSafe()
+    if _uiStatus then _uiStatus(reason) end
+    task.delay(2.5, function()
+        ST.safeCD = false
+        if _uiStatus then _uiStatus("monitoring") end
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- REMOTE HOOK
+-- Captures Communicate remote + skill immunity flag
+-- ══════════════════════════════════════════════════════════════
+local mt = getrawmetatable(game)
+local oldNC = mt.__namecall
+pcall(function()
+    setreadonly(mt, false)
+    mt.__namecall = function(self, ...)
+        local m = getnamecallmethod()
+        if m == "FireServer" and self.Name == "Communicate" then
+            local args = {...}
+            if type(args[1]) == "table" then
+                local g = args[1].Goal
+                -- Our own skill/M1 — disable safe detection for 3s
+                if g == "Console Move" or g == "LeftClick" then
+                    ST.skillActive = true
+                    ST.skillUntil  = tick() + 3.0
+                end
+            end
+        end
+        return oldNC(self, ...)
+    end
+    setreadonly(mt, true)
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- ANTI-FLING — hacker detection only
+-- ══════════════════════════════════════════════════════════════
+RS.Heartbeat:Connect(function()
+    if not hrp or not human or human.Health <= 0 then return end
+    -- Clear skill immunity
+    if ST.skillActive and tick() > ST.skillUntil then
+        ST.skillActive = false
+    end
+    -- Only fling detect when NOT using our own moves
+    if ST.skillActive then return end
+    local mag = hrp.AssemblyLinearVelocity.Magnitude
+    if mag > CFG.antiFlingThresh and not ST.isSafe then
+        ST.flung = true
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        goSafe("fling")
+        task.delay(0.5, function() ST.flung = false end)
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- MAIN SAFE DETECTION LOOP
+-- ══════════════════════════════════════════════════════════════
+RS.Heartbeat:Connect(function()
+    if not hrp or not human or human.Health <= 0 then return end
+    local pos = hrp.Position
+    local hpPct = (human.Health/human.MaxHealth)*100
+
+    -- Safe mode return logic
+    if ST.isSafe then
+        if hpPct >= CFG.safeReturnPct and not ST.safeCD then
+            ST.isSafe = false
+            snapToEnemy()
+            if _uiStatus then _uiStatus("returned") end
+        elseif pos.Y < CFG.safeY - 10 and not ST.safeCD then
+            snapToSafe()
+        end
+        return
+    end
+
+    -- Ignore all safe triggers while using our own skill/move
+    if ST.skillActive then return end
+
+    -- Low HP
+    if hpPct <= CFG.lowHPPct and not ST.safeCD then
+        goSafe("lowhp") return
+    end
+
+    -- Real void
+    if pos.Y < CFG.voidY and not ST.safeCD then
+        goSafe("void") return
+    end
+
+    -- Edge
+    if (math.abs(pos.X) > CFG.edgeLimit or math.abs(pos.Z) > CFG.edgeLimit) and not ST.safeCD then
+        goSafe("edge") return
+    end
+
+    -- Sky fling by hacker
+    if pos.Y > CFG.skyFlingY and not ST.safeCD and not ST.flung then
+        goSafe("sky") return
+    end
+
+    -- Stuck underground (not during hitbox)
+    if pos.Y < -10 and not ST.isSafe and not ST.active and not ST.safeCD then
+        goSafe("stuck") return
+    end
+
+    -- One-shot detection
+    local hp = human.Health
+    if hp < ST.lastHPVal - 85 and not ST.safeCD then
+        goSafe("oneshot")
+    end
+    ST.lastHPVal = hp
+
+    -- Proximity snap
+    if ST.active and hpPct >= CFG.safeReturnPct then
+        local e = ST.cachedEnemy
+        if e and e.d > CFG.proximityWatch then
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            snapToEnemy()
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- HITBOX CORE
+-- ══════════════════════════════════════════════════════════════
+local function stopHitbox()
+    getgenv().ATCH = false
+    for _, c in pairs(getgenv().connections) do pcall(function() c:Disconnect() end) end
+    getgenv().connections = {}
+    pcall(function() RS:UnbindFromRenderStep("NexusCam") end)
+    pcall(function()
+        cam.CameraSubject = human
+        cam.CameraType = Enum.CameraType.Custom
+    end)
+end
+
+local function startHitbox()
+    stopHitbox()
+    task.wait(0.08)
+    getgenv().ATCH = true
+
+    local ePart = Instance.new("Part")
+    ePart.Size=Vector3.new(.5,.5,.5) ePart.CanCollide=false ePart.CanTouch=false
+    ePart.Anchored=true ePart.Transparency=1 ePart.Parent=char
+
+    local pPart = Instance.new("Part",char)
+    pPart.Size=Vector3.new(.5,.5,.5) pPart.CanCollide=false pPart.CanTouch=false
+    pPart.Anchored=true pPart.Transparency=1
+
+    getgenv().val = ePart
+    local W = 15
+
+    local function camUpdate()
+        hideHead()
+        if ST.camLocked then
+            local en = findTarget()
+            if en then
+                local ld = Vector3.new(en.Position.X-hrp.Position.X,0,en.Position.Z-hrp.Position.Z)
+                if ld.Magnitude>0.1 then
+                    hrp.CFrame = hrp.CFrame:Lerp(CFrame.lookAt(hrp.Position,hrp.Position+ld),0.15)
+                end
+            end
+            cam.CameraType = Enum.CameraType.Custom
+            cam.CameraSubject = human
+            return
+        end
+        if UIS.MouseBehavior==Enum.MouseBehavior.LockCenter then
+            local lxz = Vector3.new(cam.CFrame.LookVector.X,0,cam.CFrame.LookVector.Z)
+            if lxz.Magnitude>0.01 then hrp.CFrame=CFrame.lookAt(hrp.Position,hrp.Position+lxz) end
+        end
+        local cpDist = (cam.CFrame.Position-pPart.Position).Magnitude
+        local ceDist = (cam.CFrame.Position-getgenv().val.Position).Magnitude
+        if cpDist<1 or ceDist<1 then
+            cam.CameraSubject=human pPart.Position=getgenv().val.Position
+        else
+            cam.CameraSubject=pPart
+            TS:Create(pPart,TweenInfo.new(2/W),{Position=ePart.Position}):Play()
+        end
+    end
+
+    getgenv().connections["Cam"] = RS:BindToRenderStep("NexusCam",Enum.RenderPriority.First.Value,camUpdate)
+    getgenv().val = ePart
+
+    getgenv().connections["HPW"] = RS.Heartbeat:Connect(function()
+        local hp = human.Health
+        if hp < ST.lastHPVal then ST.damagedUntil=tick()+0.4 end
+        ST.lastHPVal = hp
+    end)
+
+    getgenv().connections["Main"] = RS.Heartbeat:Connect(function()
+        if not ST.active then return end
+        if ST.isSafe then return end
+        local en = findTarget()
+        if not en then return end
+        getgenv().EN = en
+
+        local name = tostring(en)
+        pushHist(name, en.Position)
+        local px, pz = predPos(en)
+
+        local old  = hrp.CFrame
+        local old2 = char:FindFirstChild("Head") and char.Head.CFrame or old
+        ePart.CFrame = old2
+
+        -- Underground hacker detection
+        local enemyUnderground = en.Position.Y < -5
+        if not isSafeToRestore(old, enemyUnderground) then return end
+
+        -- Adaptive Y — matches hacker underground position
+        local hitY = getHitboxY(en)
+        hrp.CFrame = CFrame.new(px, hitY, pz) * CFrame.Angles(math.rad(90), 0, 0)
+        ePart.CFrame = old2
+        RS.RenderStepped:Wait()
+        hrp.CFrame = old
+        hrp.CFrame = CFrame.lookAt(
+            hrp.Position,
+            Vector3.new(en.Position.X, hrp.Position.Y, en.Position.Z)
+        )
+    end)
+
+    task.spawn(function()
+        repeat task.wait(0.1) until not ST.active or human.Health<=0
+        pcall(function() ePart:Destroy() end)
+        pcall(function() pPart:Destroy() end)
+        stopHitbox()
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- DEATH
+-- ══════════════════════════════════════════════════════════════
+human.Died:Connect(function()
+    makeInvisible()
+    goSafe("death")
+end)
+
+buildPlatform()
+
+-- ══════════════════════════════════════════════════════════════
+-- HIT FX
+-- ══════════════════════════════════════════════════════════════
+local hitFxGui = Instance.new("ScreenGui")
+hitFxGui.Name="NexusHitFX" hitFxGui.ResetOnSpawn=false
+hitFxGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+hitFxGui.Parent=lp:WaitForChild("PlayerGui")
+
+local vfx = Instance.new("Frame")
+vfx.Size=UDim2.new(1,0,1,0) vfx.BackgroundColor3=Color3.fromRGB(255,15,15)
+vfx.BackgroundTransparency=1 vfx.BorderSizePixel=0 vfx.ZIndex=100 vfx.Parent=hitFxGui
+
+local comboH = Instance.new("Frame")
+comboH.Size=UDim2.new(0,130,0,72) comboH.Position=UDim2.new(0.5,-65,0.58,0)
+comboH.BackgroundTransparency=1 comboH.Visible=false comboH.ZIndex=90 comboH.Parent=hitFxGui
+
+local comboN = Instance.new("TextLabel")
+comboN.Size=UDim2.new(1,0,0,50) comboN.BackgroundTransparency=1
+comboN.Font=Enum.Font.GothamBold comboN.TextSize=50
+comboN.TextStrokeTransparency=0.1 comboN.TextStrokeColor3=Color3.fromRGB(0,0,0)
+comboN.ZIndex=90 comboN.Parent=comboH
+
+local comboL = Instance.new("TextLabel")
+comboL.Size=UDim2.new(1,0,0,18) comboL.Position=UDim2.new(0,0,0,50)
+comboL.BackgroundTransparency=1 comboL.Text="COMBO"
+comboL.Font=Enum.Font.GothamBold comboL.TextSize=11
+comboL.TextColor3=Color3.fromRGB(200,200,200)
+comboL.TextStrokeTransparency=0.3 comboL.ZIndex=90 comboL.Parent=comboH
+
+local function dmgPopup(amount, worldPos)
+    local sp, onS = cam:WorldToViewportPoint(worldPos+Vector3.new(0,2.5,0))
+    if not onS or sp.Z<=0 then return end
+    local lbl = Instance.new("TextLabel")
+    lbl.Size=UDim2.new(0,130,0,50) lbl.AnchorPoint=Vector2.new(0.5,0.5)
+    lbl.Position=UDim2.new(0,sp.X,0,sp.Y) lbl.BackgroundTransparency=1
+    lbl.Font=Enum.Font.GothamBold lbl.TextStrokeTransparency=0.08
+    lbl.TextStrokeColor3=Color3.fromRGB(50,0,0) lbl.ZIndex=95
+    local sz
+    if amount>=25 then
+        lbl.Text="💥 "..math.floor(amount) lbl.TextColor3=Color3.fromRGB(255,18,18) sz=36
+    elseif amount>=15 then
+        lbl.Text="-"..math.floor(amount) lbl.TextColor3=Color3.fromRGB(255,90,20) sz=27
+    elseif amount>=8 then
+        lbl.Text="-"..math.floor(amount) lbl.TextColor3=Color3.fromRGB(255,195,30) sz=20
+    else
+        lbl.Text="-"..math.floor(amount) lbl.TextColor3=Color3.fromRGB(240,240,240) sz=14
+    end
+    lbl.TextSize=sz*0.4 lbl.Parent=hitFxGui
+    TS:Create(lbl,TweenInfo.new(0.12,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{TextSize=sz}):Play()
+    task.delay(0.12,function()
+        TS:Create(lbl,TweenInfo.new(0.65,Enum.EasingStyle.Quint),{
+            Position=UDim2.new(0,sp.X+math.random(-28,28),0,sp.Y-88),
+            TextTransparency=1,TextStrokeTransparency=1
+        }):Play()
+        task.delay(0.65,function() lbl:Destroy() end)
+    end)
+end
+
+local function onHit(amount, worldPos)
+    ST.hitCombo+=1 ST.totalDmg+=amount ST.lastHitTime=tick()
+    vfx.BackgroundTransparency=0.83
+    TS:Create(vfx,TweenInfo.new(0.22),{BackgroundTransparency=1}):Play()
+    local ln=Instance.new("Frame") ln.Size=UDim2.new(1,0,0,2)
+    ln.Position=UDim2.new(0,0,0.5,0) ln.BackgroundColor3=Color3.fromRGB(255,20,20)
+    ln.BackgroundTransparency=0.2 ln.BorderSizePixel=0 ln.ZIndex=98 ln.Parent=hitFxGui
+    TS:Create(ln,TweenInfo.new(0.22),{BackgroundTransparency=1}):Play()
+    task.delay(0.22,function() ln:Destroy() end)
+    dmgPopup(amount, worldPos)
+    comboH.Visible=true
+    comboN.Text=tostring(ST.hitCombo)
+    local col = ST.hitCombo>=15 and Color3.fromRGB(255,0,220)
+        or ST.hitCombo>=8 and Color3.fromRGB(255,70,0)
+        or Color3.fromRGB(255,28,28)
+    comboN.TextColor3=col
+    comboN.TextSize=62
+    TS:Create(comboN,TweenInfo.new(0.14,Enum.EasingStyle.Back),{TextSize=50}):Play()
+end
+
+RS.Heartbeat:Connect(function()
+    if ST.hitCombo>0 and (tick()-ST.lastHitTime)>2.5 then
+        ST.hitCombo=0
+        task.delay(0.25,function() comboH.Visible=false end)
+    end
+    if not ST.active then return end
+    for _, part in pairs(workspace.Live:GetChildren()) do
+        if part:IsA("Model") and part~=char then
+            local h=part:FindFirstChildOfClass("Humanoid")
+            local r=part:FindFirstChild("HumanoidRootPart")
+            if h and r and h.Health>0 then
+                local id=tostring(part)
+                local prev=ST.lastEnemyHP[id] or h.Health
+                local diff=prev-h.Health
+                if diff>0.5 and (r.Position-hrp.Position).Magnitude<60 then
+                    onHit(diff,r.Position)
+                end
+                ST.lastEnemyHP[id]=h.Health
+            end
+        end
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- CROSSHAIR
+-- ══════════════════════════════════════════════════════════════
+local xGui = Instance.new("ScreenGui")
+xGui.Name="NexusCross" xGui.ResetOnSpawn=false
+xGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling xGui.Parent=lp:WaitForChild("PlayerGui")
+
+local xF = Instance.new("Frame")
+xF.Size=UDim2.new(0,64,0,64) xF.AnchorPoint=Vector2.new(0.5,0.5)
+xF.BackgroundTransparency=1 xF.Visible=false xF.Parent=xGui
+
+local function xCorner(xS,yS,oX,oY)
+    local h=Instance.new("Frame") h.Size=UDim2.new(0,13,0,2)
+    h.Position=UDim2.new(xS,oX,yS,oY) h.BackgroundColor3=Color3.new(1,1,1)
+    h.BorderSizePixel=0 h.Parent=xF
+    local v=Instance.new("Frame") v.Size=UDim2.new(0,2,0,13)
+    v.Position=UDim2.new(xS,oX,yS,oY) v.BackgroundColor3=Color3.new(1,1,1)
+    v.BorderSizePixel=0 v.Parent=xF
+end
+xCorner(0,0,0,0) xCorner(1,0,-13,0) xCorner(0,1,0,-13) xCorner(1,1,-13,-13)
+local xDot=Instance.new("Frame") xDot.Size=UDim2.new(0,4,0,4)
+xDot.Position=UDim2.new(0.5,-2,0.5,-2) xDot.BackgroundColor3=Color3.new(1,1,1)
+xDot.BorderSizePixel=0 xDot.Parent=xF
+Instance.new("UICorner",xDot).CornerRadius=UDim.new(1,0)
+local xName=Instance.new("TextLabel") xName.Size=UDim2.new(0,150,0,18)
+xName.Position=UDim2.new(0.5,-75,0,-22) xName.BackgroundTransparency=1
+xName.Font=Enum.Font.GothamBold xName.TextSize=12
+xName.TextStrokeTransparency=0.35 xName.Parent=xF
+
+local sX,sY=0,0
+RS.RenderStepped:Connect(function()
+    if not ST.camLocked then xF.Visible=false return end
+    local en=findTarget()
+    if not en then xF.Visible=false return end
+    local sp,onS=cam:WorldToViewportPoint(en.Position+Vector3.new(0,2,0))
+    if onS and sp.Z>0 then
+        xF.Visible=true
+        sX+=(sp.X-sX)*0.25 sY+=(sp.Y-sY)*0.25
+        xF.Position=UDim2.new(0,sX,0,sY)
+        local d=(en.Position-hrp.Position).Magnitude
+        local sz=math.clamp(80-d*0.3,44,80)
+        xF.Size=UDim2.new(0,sz,0,sz)
+        local col=d<10 and Color3.fromRGB(255,50,50) or d<25 and Color3.fromRGB(255,205,0) or Color3.new(1,1,1)
+        for _,v in ipairs(xF:GetDescendants()) do if v:IsA("Frame") then v.BackgroundColor3=col end end
+        local dn=en.Parent.Name
+        for _,pl in ipairs(Players:GetPlayers()) do if pl.Character==en.Parent then dn=pl.DisplayName break end end
+        xName.Text=dn xName.TextColor3=col
+    else xF.Visible=false end
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- NEXUS UI
+-- ══════════════════════════════════════════════════════════════
+local GUI = Instance.new("ScreenGui")
+GUI.Name="NexusUI" GUI.ResetOnSpawn=false
+GUI.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+GUI.Parent=lp:WaitForChild("PlayerGui")
+
+local N = {
+    base   = Color3.fromRGB(6,6,9),
+    surf   = Color3.fromRGB(13,13,18),
+    card   = Color3.fromRGB(20,20,28),
+    card2  = Color3.fromRGB(26,26,36),
+    line   = Color3.fromRGB(36,36,50),
+    red    = Color3.fromRGB(219,34,34),
+    redHi  = Color3.fromRGB(255,60,60),
+    green  = Color3.fromRGB(34,197,94),
+    blue   = Color3.fromRGB(56,128,255),
+    amber  = Color3.fromRGB(245,158,11),
+    purple = Color3.fromRGB(139,92,246),
+    txt    = Color3.fromRGB(215,215,228),
+    dim    = Color3.fromRGB(88,88,108),
+    white  = Color3.fromRGB(255,255,255),
+}
+
+local function stroke(p,col,thick)
+    local s=Instance.new("UIStroke") s.Color=col or N.line s.Thickness=thick or 1 s.Parent=p return s
+end
+local function corner(p,r) Instance.new("UICorner",p).CornerRadius=UDim.new(0,r or 10) end
+local function grad(p,c0,c1,rot)
+    local g=Instance.new("UIGradient")
+    g.Color=ColorSequence.new{ColorSequenceKeypoint.new(0,c0),ColorSequenceKeypoint.new(1,c1)}
+    g.Rotation=rot or 90 g.Parent=p return g
+end
+
+-- Trigger
+local triggerFrame=Instance.new("Frame")
+triggerFrame.Size=UDim2.new(0,46,0,46)
+triggerFrame.Position=UDim2.new(0,8,0.5,-23)
+triggerFrame.BackgroundColor3=N.surf
+triggerFrame.BorderSizePixel=0 triggerFrame.ZIndex=20 triggerFrame.Active=true
+triggerFrame.Parent=GUI
+corner(triggerFrame,23) stroke(triggerFrame,N.line,1.5)
+grad(triggerFrame,Color3.fromRGB(20,20,30),N.surf)
+
+local trigIco=Instance.new("TextLabel")
+trigIco.Size=UDim2.new(1,0,1,0) trigIco.BackgroundTransparency=1
+trigIco.Text="◈" trigIco.TextColor3=N.red
+trigIco.Font=Enum.Font.GothamBold trigIco.TextSize=22
+trigIco.ZIndex=21 trigIco.Parent=triggerFrame
+
+local pulseRing=Instance.new("Frame")
+pulseRing.Size=UDim2.new(1,0,1,0) pulseRing.BackgroundTransparency=1
+pulseRing.BorderSizePixel=0 pulseRing.ZIndex=19 pulseRing.Parent=triggerFrame
+stroke(pulseRing,N.red,1.5) corner(pulseRing,23)
+
+local mDot=Instance.new("Frame")
+mDot.Size=UDim2.new(0,8,0,8) mDot.Position=UDim2.new(1,-9,0,1)
+mDot.BackgroundColor3=N.dim mDot.BorderSizePixel=0 mDot.ZIndex=22
+mDot.Parent=triggerFrame corner(mDot,4)
+
+-- Main window
+local win=Instance.new("Frame")
+win.Size=UDim2.new(0,230,0,48)
+win.Position=UDim2.new(0,62,0.5,-24)
+win.BackgroundColor3=N.base
+win.BorderSizePixel=0 win.Active=true
+win.Visible=false win.ClipsDescendants=true
+win.ZIndex=10 win.Parent=GUI
+corner(win,14) stroke(win,N.line,1.2)
+grad(win,Color3.fromRGB(12,12,18),N.base)
+
+local accentLine=Instance.new("Frame")
+accentLine.Size=UDim2.new(0.6,0,0,1.5)
+accentLine.Position=UDim2.new(0.2,0,0,0)
+accentLine.BackgroundColor3=N.red
+accentLine.BackgroundTransparency=0.4
+accentLine.BorderSizePixel=0 accentLine.ZIndex=11 accentLine.Parent=win
+
+local dr,ds,dsp=false,nil,nil
+win.InputBegan:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then
+        dr=true ds=i.Position dsp=win.Position
+    end
+end)
+win.InputChanged:Connect(function(i)
+    if dr and (i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseMove) then
+        local d=i.Position-ds
+        win.Position=UDim2.new(dsp.X.Scale,dsp.X.Offset+d.X,dsp.Y.Scale,dsp.Y.Offset+d.Y)
+    end
+end)
+win.InputEnded:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then dr=false end
+end)
+
+local panelOpen=false
+local isExpanded=false
+
+local trigBtn=Instance.new("TextButton")
+trigBtn.Size=UDim2.new(1,0,1,0) trigBtn.BackgroundTransparency=1
+trigBtn.Text="" trigBtn.ZIndex=23 trigBtn.Parent=triggerFrame
+trigBtn.MouseButton1Click:Connect(function()
+    panelOpen=not panelOpen
+    if panelOpen then
+        win.Visible=true win.Size=UDim2.new(0,0,0,48)
+        TS:Create(win,TweenInfo.new(0.2,Enum.EasingStyle.Quint),{Size=UDim2.new(0,230,0,48)}):Play()
+        TS:Create(triggerFrame,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(20,8,8)}):Play()
+        TS:Create(trigIco,TweenInfo.new(0.15),{TextColor3=N.redHi}):Play()
+    else
+        if isExpanded then
+            isExpanded=false expPanel.Visible=false
+            win.Size=UDim2.new(0,230,0,48)
+        end
+        TS:Create(win,TweenInfo.new(0.15,Enum.EasingStyle.Quint),{Size=UDim2.new(0,0,0,48)}):Play()
+        TS:Create(triggerFrame,TweenInfo.new(0.15),{BackgroundColor3=N.surf}):Play()
+        TS:Create(trigIco,TweenInfo.new(0.15),{TextColor3=N.red}):Play()
+        task.delay(0.15,function() if not panelOpen then win.Visible=false end end)
+    end
+end)
+
+local bar=Instance.new("Frame")
+bar.Size=UDim2.new(1,0,0,48) bar.BackgroundTransparency=1 bar.ZIndex=11 bar.Parent=win
+
+local onBtn=Instance.new("TextButton")
+onBtn.Size=UDim2.new(0,72,0,32) onBtn.Position=UDim2.new(0,6,0.5,-16)
+onBtn.BackgroundColor3=Color3.fromRGB(18,18,26)
+onBtn.Font=Enum.Font.GothamBold onBtn.TextSize=11
+onBtn.TextColor3=N.dim onBtn.Text="INACTIVE"
+onBtn.BorderSizePixel=0 onBtn.ZIndex=12 onBtn.Parent=bar
+corner(onBtn,8) stroke(onBtn,N.line)
+
+local camBtn=Instance.new("TextButton")
+camBtn.Size=UDim2.new(0,28,0,28) camBtn.Position=UDim2.new(0,82,0.5,-14)
+camBtn.BackgroundColor3=Color3.fromRGB(16,16,24) camBtn.Text="📷"
+camBtn.Font=Enum.Font.GothamBold camBtn.TextSize=13
+camBtn.BorderSizePixel=0 camBtn.ZIndex=12 camBtn.Parent=bar
+corner(camBtn,7) stroke(camBtn,N.line)
+
+local sfBtn=Instance.new("TextButton")
+sfBtn.Size=UDim2.new(0,28,0,28) sfBtn.Position=UDim2.new(0,114,0.5,-14)
+sfBtn.BackgroundColor3=Color3.fromRGB(10,16,30) sfBtn.Text="🛡"
+sfBtn.Font=Enum.Font.GothamBold sfBtn.TextSize=13
+sfBtn.BorderSizePixel=0 sfBtn.ZIndex=12 sfBtn.Parent=bar
+corner(sfBtn,7) stroke(sfBtn,Color3.fromRGB(28,50,100))
+sfBtn.MouseButton1Click:Connect(function() ST.safeCD=false goSafe("manual") end)
+
+local stLbl=Instance.new("TextLabel")
+stLbl.Size=UDim2.new(0,42,1,0) stLbl.Position=UDim2.new(0,146,0,0)
+stLbl.BackgroundTransparency=1 stLbl.Text="IDLE"
+stLbl.TextColor3=N.dim stLbl.Font=Enum.Font.GothamBold
+stLbl.TextSize=8 stLbl.TextWrapped=true
+stLbl.TextXAlignment=Enum.TextXAlignment.Left stLbl.ZIndex=12 stLbl.Parent=bar
+
+local chevBtn=Instance.new("TextButton")
+chevBtn.Size=UDim2.new(0,20,0,20) chevBtn.Position=UDim2.new(1,-26,0.5,-10)
+chevBtn.BackgroundColor3=Color3.fromRGB(16,16,22) chevBtn.TextColor3=N.dim
+chevBtn.Text="⌄" chevBtn.Font=Enum.Font.GothamBold chevBtn.TextSize=11
+chevBtn.BorderSizePixel=0 chevBtn.ZIndex=12 chevBtn.Parent=bar
+corner(chevBtn,5)
+
+local expPanel=Instance.new("Frame")
+expPanel.Size=UDim2.new(1,0,0,310) expPanel.Position=UDim2.new(0,0,0,48)
+expPanel.BackgroundTransparency=1 expPanel.Visible=false expPanel.ZIndex=11 expPanel.Parent=win
+
+local sep=Instance.new("Frame")
+sep.Size=UDim2.new(1,-12,0,1) sep.Position=UDim2.new(0,6,0,0)
+sep.BackgroundColor3=N.line sep.BackgroundTransparency=0.4
+sep.BorderSizePixel=0 sep.ZIndex=12 sep.Parent=expPanel
+
+local esc=Instance.new("ScrollingFrame")
+esc.Size=UDim2.new(1,0,0,308) esc.Position=UDim2.new(0,0,0,2)
+esc.BackgroundTransparency=1 esc.BorderSizePixel=0
+esc.ScrollBarThickness=2 esc.ScrollBarImageColor3=N.line
+esc.CanvasSize=UDim2.new(0,0,0,0) esc.AutomaticCanvasSize=Enum.AutomaticSize.Y
+esc.ZIndex=12 esc.Parent=expPanel
+local el=Instance.new("UIListLayout") el.Padding=UDim.new(0,4) el.Parent=esc
+local ep=Instance.new("UIPadding")
+ep.PaddingTop=UDim.new(0,5) ep.PaddingLeft=UDim.new(0,6)
+ep.PaddingRight=UDim.new(0,6) ep.PaddingBottom=UDim.new(0,6) ep.Parent=esc
+
+local function secLbl(txt)
+    local f=Instance.new("TextLabel") f.Size=UDim2.new(1,0,0,14)
+    f.BackgroundTransparency=1 f.Text=txt f.TextColor3=N.dim
+    f.Font=Enum.Font.GothamBold f.TextSize=8
+    f.TextXAlignment=Enum.TextXAlignment.Left f.ZIndex=13 f.Parent=esc
+end
+
+local function statRow(ico, lbl, col)
+    local f=Instance.new("Frame") f.Size=UDim2.new(1,0,0,24)
+    f.BackgroundColor3=N.card f.BorderSizePixel=0 f.ZIndex=13 f.Parent=esc
+    corner(f,6)
+    local i=Instance.new("TextLabel") i.Size=UDim2.new(0,18,1,0)
+    i.BackgroundTransparency=1 i.Text=ico i.Font=Enum.Font.GothamBold
+    i.TextSize=11 i.ZIndex=14 i.Parent=f
+    local l=Instance.new("TextLabel") l.Size=UDim2.new(0.55,0,1,0) l.Position=UDim2.new(0,18,0,0)
+    l.BackgroundTransparency=1 l.Text=lbl l.TextColor3=N.dim
+    l.Font=Enum.Font.Gotham l.TextSize=9 l.TextXAlignment=Enum.TextXAlignment.Left
+    l.ZIndex=14 l.Parent=f
+    local v=Instance.new("TextLabel") v.Size=UDim2.new(0.4,-4,1,0) v.Position=UDim2.new(0.6,0,0,0)
+    v.BackgroundTransparency=1 v.Text="—" v.TextColor3=col or N.txt
+    v.Font=Enum.Font.GothamBold v.TextSize=9 v.TextXAlignment=Enum.TextXAlignment.Right
+    v.ZIndex=14 v.Parent=f
+    return v
+end
+
+local function mkToggle(lbl, getter, setter)
+    local f=Instance.new("Frame") f.Size=UDim2.new(1,0,0,26)
+    f.BackgroundColor3=N.card f.BorderSizePixel=0 f.ZIndex=13 f.Parent=esc
+    corner(f,7)
+    local t=Instance.new("TextLabel") t.Size=UDim2.new(0.72,0,1,0) t.Position=UDim2.new(0,8,0,0)
+    t.BackgroundTransparency=1 t.Text=lbl t.TextColor3=N.dim
+    t.Font=Enum.Font.Gotham t.TextSize=9 t.TextXAlignment=Enum.TextXAlignment.Left
+    t.ZIndex=14 t.Parent=f
+    local pill=Instance.new("Frame") pill.Size=UDim2.new(0,32,0,16) pill.Position=UDim2.new(1,-38,0.5,-8)
+    pill.BorderSizePixel=0 pill.ZIndex=14 pill.Parent=f corner(pill,8)
+    local knob=Instance.new("Frame") knob.Size=UDim2.new(0,11,0,11)
+    knob.BorderSizePixel=0 knob.ZIndex=15 knob.Parent=pill corner(knob,6)
+    local function set(v)
+        setter(v)
+        TS:Create(pill,TweenInfo.new(0.12),{BackgroundColor3=v and N.green or N.line}):Play()
+        TS:Create(knob,TweenInfo.new(0.12),{
+            Position=v and UDim2.new(0,18,0.5,-5) or UDim2.new(0,3,0.5,-5),
+            BackgroundColor3=v and N.white or N.dim
+        }):Play()
+    end
+    set(getter())
+    local btn=Instance.new("TextButton") btn.Size=UDim2.new(1,0,1,0)
+    btn.BackgroundTransparency=1 btn.Text="" btn.ZIndex=16 btn.Parent=f
+    btn.MouseButton1Click:Connect(function() set(not getter()) end)
+end
+
+local function mkAction(lbl, col, fn)
+    local b=Instance.new("TextButton") b.Size=UDim2.new(1,0,0,24)
+    b.BackgroundColor3=Color3.fromRGB(14,14,20) b.TextColor3=col
+    b.Text=lbl b.Font=Enum.Font.GothamBold b.TextSize=9
+    b.BorderSizePixel=0 b.ZIndex=13 b.Parent=esc
+    corner(b,6) stroke(b,col,0.8)
+    b.MouseButton1Click:Connect(fn) return b
+end
+
+local plSc=Instance.new("ScrollingFrame") plSc.Size=UDim2.new(1,0,0,52)
+plSc.BackgroundColor3=Color3.fromRGB(9,9,14) plSc.BorderSizePixel=0
+plSc.ScrollBarThickness=2 plSc.ScrollBarImageColor3=N.line
+plSc.CanvasSize=UDim2.new(0,0,0,0) plSc.AutomaticCanvasSize=Enum.AutomaticSize.Y
+plSc.ZIndex=13 plSc.Parent=esc corner(plSc,6)
+local plL=Instance.new("UIListLayout") plL.Padding=UDim.new(0,2) plL.Parent=plSc
+local plP=Instance.new("UIPadding") plP.PaddingTop=UDim.new(0,2)
+plP.PaddingLeft=UDim.new(0,3) plP.PaddingRight=UDim.new(0,3) plP.Parent=plSc
+
+secLbl("ANALYTICS")
+local hitsV   = statRow("⚡","Hits",N.green)
+local dmgV    = statRow("💢","Damage",N.red)
+local distV   = statRow("◎","Distance",N.blue)
+local pingV   = statRow("📶","Ping",N.dim)
+local savesV  = statRow("⚠","Saves left",N.amber)
+local safeStV = statRow("🛡","Safe status",N.blue)
+local skillV  = statRow("⚔","Skill active",N.amber)
+
+secLbl("SAFE GUARD")
+local safeSettings={autoSafe=true,antiVoid=true,deathInvis=true,proximity=true,antiFling=true}
+mkToggle("Auto safe on low HP",function() return safeSettings.autoSafe end,function(v) safeSettings.autoSafe=v end)
+mkToggle("Anti void / edge",function() return safeSettings.antiVoid end,function(v) safeSettings.antiVoid=v end)
+mkToggle("Death invisibility",function() return safeSettings.deathInvis end,function(v) safeSettings.deathInvis=v end)
+mkToggle("Auto proximity snap (35st)",function() return safeSettings.proximity end,function(v) safeSettings.proximity=v end)
+mkToggle("Anti-fling (hacker)",function() return safeSettings.antiFling end,function(v) safeSettings.antiFling=v end)
+
+secLbl("ACTIONS")
+mkAction("👁 Restore Visibility",N.purple,function() makeVisible() end)
+mkAction("🔄 Reset Save Counter",N.amber,function() ST.killSaves=0 end)
+mkAction("⚡ Teleport to Safety",N.red,function() ST.safeCD=false goSafe("manual") end)
+
+secLbl("LOCK TARGET")
+mkAction("🔓 Clear Lock",N.dim,function()
+    getgenv().lockedTarget=nil
+    stLbl.Text="AUTO" stLbl.TextColor3=N.dim
+end)
+
+chevBtn.MouseButton1Click:Connect(function()
+    isExpanded=not isExpanded
+    if isExpanded then
+        expPanel.Visible=true chevBtn.Text="⌃"
+        TS:Create(win,TweenInfo.new(0.22,Enum.EasingStyle.Quint),{Size=UDim2.new(0,230,0,362)}):Play()
+    else
+        chevBtn.Text="⌄"
+        TS:Create(win,TweenInfo.new(0.2,Enum.EasingStyle.Quint),{Size=UDim2.new(0,230,0,48)}):Play()
+        task.delay(0.2,function() expPanel.Visible=false end)
+    end
+end)
+
+onBtn.MouseButton1Click:Connect(function()
+    ST.active=not ST.active
+    if ST.active then
+        ST.hitCount=0 ST.totalDmg=0 ST.hitCombo=0 ST.lastHPVal=human.Health
+        onBtn.Text="ACTIVE"
+        TS:Create(onBtn,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(8,24,12),TextColor3=N.green}):Play()
+        TS:Create(mDot,TweenInfo.new(0.15),{BackgroundColor3=N.green}):Play()
+        TS:Create(triggerFrame,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(8,24,12)}):Play()
+        TS:Create(trigIco,TweenInfo.new(0.15),{TextColor3=N.green}):Play()
+        stLbl.Text="ON" stLbl.TextColor3=N.green
+        task.spawn(startHitbox)
+    else
+        stopHitbox()
+        onBtn.Text="INACTIVE"
+        TS:Create(onBtn,TweenInfo.new(0.15),{BackgroundColor3=Color3.fromRGB(18,18,26),TextColor3=N.dim}):Play()
+        TS:Create(mDot,TweenInfo.new(0.15),{BackgroundColor3=N.dim}):Play()
+        TS:Create(triggerFrame,TweenInfo.new(0.15),{BackgroundColor3=N.surf}):Play()
+        TS:Create(trigIco,TweenInfo.new(0.15),{TextColor3=N.red}):Play()
+        stLbl.Text="IDLE" stLbl.TextColor3=N.dim
+        ST.lastEnemyHP={}
+    end
+end)
+
+local camStroke2=stroke(camBtn,N.line)
+camBtn.MouseButton1Click:Connect(function()
+    ST.camLocked=not ST.camLocked
+    if ST.camLocked then
+        TS:Create(camBtn,TweenInfo.new(0.12),{BackgroundColor3=Color3.fromRGB(12,28,58)}):Play()
+        camStroke2.Color=N.blue camBtn.Text="🔒"
+    else
+        TS:Create(camBtn,TweenInfo.new(0.12),{BackgroundColor3=Color3.fromRGB(16,16,24)}):Play()
+        camStroke2.Color=N.line camBtn.Text="📷"
+        xF.Visible=false
+    end
+end)
+
+_uiStatus = function(reason)
+    local map={
+        lowhp="LOW HP",void="VOID",edge="EDGE",fling="FLING",
+        sky="FLUNG",stuck="STUCK",death="DIED",manual="SAFE",
+        oneshot="1-SHOT",monitoring="SAFE ✓",returned="↩ BACK"
+    }
+    local cols={
+        lowhp=N.red,void=N.blue,edge=N.amber,fling=N.amber,
+        sky=N.amber,stuck=N.amber,death=N.purple,manual=N.blue,
+        oneshot=N.red,monitoring=N.green,returned=N.green
+    }
+    stLbl.Text=map[reason] or reason
+    stLbl.TextColor3=cols[reason] or N.dim
+end
+
+local function buildPlayerList()
+    for _,v in ipairs(plSc:GetChildren()) do if v:IsA("TextButton") then v:Destroy() end end
+    local any=false
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p~=lp then any=true
+            local b=Instance.new("TextButton")
+            b.Size=UDim2.new(1,0,0,22) b.BackgroundColor3=Color3.fromRGB(13,13,19)
+            b.TextColor3=N.dim b.Text="  👤 "..p.DisplayName
+            b.Font=Enum.Font.GothamBold b.TextSize=9 b.BorderSizePixel=0
+            b.TextXAlignment=Enum.TextXAlignment.Left b.Name=p.DisplayName b.ZIndex=14 b.Parent=plSc
+            corner(b,5)
+            b.MouseButton1Click:Connect(function()
+                for _,x in ipairs(plSc:GetChildren()) do
+                    if x:IsA("TextButton") then x.BackgroundColor3=Color3.fromRGB(13,13,19) x.TextColor3=N.dim end
+                end
+                if p.Character and p.Character:FindFirstChild("HumanoidRootPart") then
+                    getgenv().lockedTarget=p.Character.HumanoidRootPart
+                    b.BackgroundColor3=Color3.fromRGB(6,20,12) b.TextColor3=N.green
+                    b.Text="  🔒 "..p.DisplayName
+                    stLbl.Text="🔒 "..p.DisplayName stLbl.TextColor3=N.green
+                end
+            end)
+        end
+    end
+    if not any then
+        local l=Instance.new("TextLabel") l.Size=UDim2.new(1,0,0,22)
+        l.BackgroundTransparency=1 l.Text="  No players" l.TextColor3=N.dim
+        l.Font=Enum.Font.Gotham l.TextSize=9 l.ZIndex=14 l.Parent=plSc
+    end
+end
+
+buildPlayerList()
+Players.PlayerAdded:Connect(function() task.wait(0.5) buildPlayerList() end)
+Players.PlayerRemoving:Connect(function(p)
+    task.wait(0.1)
+    if getgenv().lockedTarget and getgenv().lockedTarget.Parent
+    and getgenv().lockedTarget.Parent.Name==p.Name then
+        getgenv().lockedTarget=nil stLbl.Text="AUTO"
+    end
+    buildPlayerList()
+end)
+
+-- Live stats
+local lastHealth2={}
+RS.Heartbeat:Connect(function()
+    if not human then return end
+    local hpPct=(human.Health/human.MaxHealth)*100
+    mDot.BackgroundColor3 = ST.isSafe and N.amber
+        or ST.isInvis and N.purple
+        or ST.active and N.green
+        or hpPct<=CFG.lowHPPct and N.red
+        or N.dim
+    local p=math.floor(Ping:GetValue())
+    pingV.Text=p.."ms"
+    pingV.TextColor3=p<80 and N.green or p<150 and N.amber or N.red
+    savesV.Text=(CFG.killZoneMax-ST.killSaves).." / "..CFG.killZoneMax
+    savesV.TextColor3=ST.killSaves>=CFG.killZoneMax and N.red or N.amber
+    safeStV.Text=ST.isSafe and "ACTIVE" or "Standby"
+    safeStV.TextColor3=ST.isSafe and N.amber or N.dim
+    hitsV.Text=tostring(ST.hitCount)
+    dmgV.Text=math.floor(ST.totalDmg)
+    skillV.Text=ST.skillActive and "YES" or "no"
+    skillV.TextColor3=ST.skillActive and N.amber or N.dim
+    if not ST.active then distV.Text="—" distV.TextColor3=N.dim return end
+    local en=ST.cachedEnemy
+    if en then
+        local d=math.floor(en.d)
+        distV.Text=d.." st"
+        distV.TextColor3=d<10 and N.red or d<25 and N.amber or N.blue
+        local dn=en.m.Name
+        for _,pl in ipairs(Players:GetPlayers()) do if pl.Character==en.m then dn=pl.DisplayName break end end
+        if not getgenv().lockedTarget then stLbl.Text=dn stLbl.TextColor3=N.green end
+        for _,pl in ipairs(Players:GetPlayers()) do
+            if pl~=lp and pl.Character then
+                local h=pl.Character:FindFirstChildOfClass("Humanoid")
+                if h then
+                    local prev=lastHealth2[pl.Name] or h.Health
+                    if h.Health<prev then ST.hitCount+=1 end
+                    lastHealth2[pl.Name]=h.Health
+                end
+            end
+        end
+    else
+        distV.Text="—" distV.TextColor3=N.dim
+        if not getgenv().lockedTarget then stLbl.Text="SCAN" stLbl.TextColor3=N.dim end
+    end
+end)
+
+-- ══════════════════════════════════════════════════════════════
+-- RESPAWN
+-- ══════════════════════════════════════════════════════════════
+lp.CharacterAdded:Connect(function(c)
+    char=c hrp=c:WaitForChild("HumanoidRootPart")
+    human=c:WaitForChild("Humanoid")
+    getgenv().ATCH=false getgenv().lockedTarget=nil
+    ST.camLocked=false ST.hitCount=0 ST.totalDmg=0
+    ST.hitCombo=0 ST.lastHitTime=0
+    ST.lastHPVal=human.Health ST.damagedUntil=0
+    ST.isSafe=false ST.safeCD=false ST.isInvis=false
+    ST.flung=false ST.skillActive=false ST.skillUntil=0
+    ST.originalSizes={} ST.lastEnemyHP={}
+    ST.posHist={} ST.timeHist={}
+    lastHealth2={}
+    task.delay(0.5,function()
+        local t=tick()
+        repeat task.wait(0.1) until hrp.AssemblyLinearVelocity.Magnitude<2 or tick()-t>4
+        buildPlatform()
+    end)
+    human.Died:Connect(function()
+        if safeSettings.deathInvis then makeInvisible() end
+        goSafe("death")
+    end)
+    camBtn.BackgroundColor3=Color3.fromRGB(16,16,24)
+    camBtn.Text="📷" camStroke2.Color=N.line
+    xF.Visible=false stLbl.Text="IDLE" stLbl.TextColor3=N.dim
+    mDot.BackgroundColor3=N.dim
+    buildPlayerList()
+    if ST.active then task.wait(1.2) task.spawn(startHitbox) end
+end)
+
+print("◈ NEXUS loaded")
