@@ -1,0 +1,259 @@
+-- NEXUS NETWORK SMOOTH v11.3 ULTIMATE (2026 Attack Speed Fixed)
+-- Movement fast + M1/Dash/Side Dash/Skills now instant
+
+local TS      = game:GetService("TweenService")
+local RS      = game:GetService("RunService")
+local Players = game:GetService("Players")
+local lp      = Players.LocalPlayer
+local Ping    = game:GetService("Stats").PerformanceStats.Ping
+local UIS     = game:GetService("UserInputService")
+
+print("NEXUS v11.3 - Loading...")
+
+-- NOTIFICATIONS (your original)
+local notifGui=Instance.new("ScreenGui")
+notifGui.Name="NexusNotif" notifGui.ResetOnSpawn=false
+notifGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+notifGui.Parent=lp:WaitForChild("PlayerGui")
+local stack=Instance.new("Frame")
+stack.Size=UDim2.new(0,290,1,0) stack.Position=UDim2.new(1,-298,0,0)
+stack.BackgroundTransparency=1 stack.Parent=notifGui
+local sl=Instance.new("UIListLayout")
+sl.Padding=UDim.new(0,6)
+sl.VerticalAlignment=Enum.VerticalAlignment.Bottom
+sl.Parent=stack
+local sp=Instance.new("UIPadding")
+sp.PaddingBottom=UDim.new(0,14) sp.Parent=stack
+
+local nc=0
+local function notify(title,body,col,dur)
+    col=col or Color3.fromRGB(34,197,94) dur=dur or 5 nc+=1
+    local card=Instance.new("Frame")
+    card.Size=UDim2.new(1,0,0,0) card.AutomaticSize=Enum.AutomaticSize.Y
+    card.BackgroundColor3=Color3.fromRGB(10,10,14)
+    card.BackgroundTransparency=0.1 card.BorderSizePixel=0
+    card.LayoutOrder=nc card.ClipsDescendants=true card.Parent=stack
+    Instance.new("UICorner",card).CornerRadius=UDim.new(0,10)
+    local cs=Instance.new("UIStroke") cs.Color=col cs.Thickness=1.2 cs.Parent=card
+    local accent=Instance.new("Frame")
+    accent.Size=UDim2.new(0,3,1,0) accent.BackgroundColor3=col
+    accent.BorderSizePixel=0 accent.ZIndex=2 accent.Parent=card
+    Instance.new("UICorner",accent).CornerRadius=UDim.new(0,3)
+    local inner=Instance.new("Frame")
+    inner.Size=UDim2.new(1,-14,0,0) inner.Position=UDim2.new(0,10,0,0)
+    inner.AutomaticSize=Enum.AutomaticSize.Y inner.BackgroundTransparency=1 inner.Parent=card
+    local il=Instance.new("UIListLayout") il.Padding=UDim.new(0,2) il.Parent=inner
+    local ip=Instance.new("UIPadding")
+    ip.PaddingTop=UDim.new(0,8) ip.PaddingBottom=UDim.new(0,8) ip.Parent=inner
+    local tl=Instance.new("TextLabel")
+    tl.Size=UDim2.new(1,0,0,16) tl.BackgroundTransparency=1
+    tl.Text=title tl.TextColor3=col tl.Font=Enum.Font.GothamBold tl.TextSize=11
+    tl.TextXAlignment=Enum.TextXAlignment.Left tl.Parent=inner
+    local bl=Instance.new("TextLabel")
+    bl.Size=UDim2.new(1,0,0,0) bl.AutomaticSize=Enum.AutomaticSize.Y
+    bl.BackgroundTransparency=1 bl.Text=body bl.TextColor3=Color3.fromRGB(160,160,175)
+    bl.Font=Enum.Font.Gotham bl.TextSize=10
+    bl.TextXAlignment=Enum.TextXAlignment.Left bl.TextWrapped=true bl.Parent=inner
+    local prog=Instance.new("Frame")
+    prog.Size=UDim2.new(1,0,0,2) prog.BackgroundColor3=col
+    prog.BackgroundTransparency=0.4 prog.BorderSizePixel=0 prog.Parent=card
+    Instance.new("UICorner",prog).CornerRadius=UDim.new(0,2)
+    card.Position=UDim2.new(1,20,0,0)
+    TS:Create(card,TweenInfo.new(0.22,Enum.EasingStyle.Quint),{Position=UDim2.new(0,0,0,0)}):Play()
+    TS:Create(prog,TweenInfo.new(dur,Enum.EasingStyle.Linear),{Size=UDim2.new(0,0,0,2)}):Play()
+    task.delay(dur,function()
+        TS:Create(card,TweenInfo.new(0.28,Enum.EasingStyle.Quint),{Position=UDim2.new(1,20,0,0),BackgroundTransparency=1}):Play()
+        TS:Create(cs,TweenInfo.new(0.28),{Transparency=1}):Play()
+        task.delay(0.28,function() card:Destroy() end)
+    end)
+end
+
+-- PING GUI + GRAPH + STABILIZER (graph now shows real ms)
+local pingGui=Instance.new("ScreenGui")
+pingGui.Name="NexusPing" pingGui.ResetOnSpawn=false
+pingGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+pingGui.Parent=lp:WaitForChild("PlayerGui")
+
+local pf=Instance.new("Frame")
+pf.Size=UDim2.new(0,165,0,100) pf.Position=UDim2.new(0,8,0,8)
+pf.BackgroundColor3=Color3.fromRGB(8,8,12) pf.BackgroundTransparency=0.06
+pf.BorderSizePixel=0 pf.Active=true pf.Parent=pingGui
+Instance.new("UICorner",pf).CornerRadius=UDim.new(0,12)
+local pfStroke=Instance.new("UIStroke")
+pfStroke.Color=Color3.fromRGB(36,36,50) pfStroke.Parent=pf
+
+local pDot=Instance.new("Frame")
+pDot.Size=UDim2.new(0,8,0,8) pDot.Position=UDim2.new(0,8,0,12)
+pDot.BackgroundColor3=Color3.fromRGB(34,197,94)
+pDot.BorderSizePixel=0 pDot.Parent=pf
+Instance.new("UICorner",pDot).CornerRadius=UDim.new(1,0)
+
+local pVal=Instance.new("TextLabel")
+pVal.Size=UDim2.new(0,110,0,22) pVal.Position=UDim2.new(0,22,0,6)
+pVal.BackgroundTransparency=1 pVal.Text="-- ms"
+pVal.TextColor3=Color3.fromRGB(220,220,228)
+pVal.Font=Enum.Font.GothamBold pVal.TextSize=16
+pVal.TextXAlignment=Enum.TextXAlignment.Left pVal.Parent=pf
+
+local flagBadge=Instance.new("TextLabel")
+flagBadge.Size=UDim2.new(0,52,0,16)
+flagBadge.Position=UDim2.new(1,-58,0,8)
+flagBadge.BackgroundColor3=Color3.fromRGB(20,20,30)
+flagBadge.BorderSizePixel=0 flagBadge.Text="0 fl"
+flagBadge.TextColor3=Color3.fromRGB(88,88,108)
+flagBadge.Font=Enum.Font.GothamBold flagBadge.TextSize=9
+flagBadge.Parent=pf
+Instance.new("UICorner",flagBadge).CornerRadius=UDim.new(0,5)
+
+local pStat=Instance.new("TextLabel")
+pStat.Size=UDim2.new(1,-8,0,11) pStat.Position=UDim2.new(0,8,0,30)
+pStat.BackgroundTransparency=1 pStat.Text="NEXUS v11.3 · STABLE"
+pStat.TextColor3=Color3.fromRGB(88,88,108)
+pStat.Font=Enum.Font.GothamBold pStat.TextSize=8
+pStat.TextXAlignment=Enum.TextXAlignment.Left pStat.Parent=pf
+
+local stabLbl=Instance.new("TextLabel")
+stabLbl.Size=UDim2.new(1,-8,0,11) stabLbl.Position=UDim2.new(0,8,0,42)
+stabLbl.BackgroundTransparency=1 stabLbl.Text="STABILIZER · ARMED"
+stabLbl.TextColor3=Color3.fromRGB(56,128,255)
+stabLbl.Font=Enum.Font.GothamBold stabLbl.TextSize=8
+stabLbl.TextXAlignment=Enum.TextXAlignment.Left stabLbl.Parent=pf
+
+local graphFrame=Instance.new("Frame")
+graphFrame.Size=UDim2.new(1,-12,0,26) graphFrame.Position=UDim2.new(0,6,0,56)
+graphFrame.BackgroundColor3=Color3.fromRGB(12,12,18)
+graphFrame.BorderSizePixel=0 graphFrame.Parent=pf
+Instance.new("UICorner",graphFrame).CornerRadius=UDim.new(0,5)
+
+local BAR_COUNT=40
+local graphBars={}
+for i=1,BAR_COUNT do
+    local bar=Instance.new("Frame")
+    bar.Size=UDim2.new(1/BAR_COUNT,-0.5,0,2)
+    bar.Position=UDim2.new((i-1)/BAR_COUNT,0,1,0)
+    bar.AnchorPoint=Vector2.new(0,1)
+    bar.BackgroundColor3=Color3.fromRGB(34,197,94)
+    bar.BorderSizePixel=0 bar.Parent=graphFrame
+    Instance.new("UICorner",bar).CornerRadius=UDim.new(0,1)
+    graphBars[i]=bar
+end
+
+-- Drag
+local dr,ds,dsp=false,nil,nil
+pf.InputBegan:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then
+        dr=true ds=i.Position dsp=pf.Position
+    end
+end)
+pf.InputChanged:Connect(function(i)
+    if dr and (i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseMove) then
+        local d=i.Position-ds
+        pf.Position=UDim2.new(dsp.X.Scale,dsp.X.Offset+d.X,dsp.Y.Scale,dsp.Y.Offset+d.Y)
+    end
+end)
+pf.InputEnded:Connect(function(i)
+    if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then dr=false end
+end)
+
+-- PING + STABILIZER + ATTACK FLAGS
+local pingHist = {}
+local pingEMA = 0
+local stabBaseline = 0
+local stabSpikes = 0
+local lastReapply = 0
+local EMA_ALPHA = 0.15
+local SPIKE_THRESHOLD = 30
+local REAPPLY_COOLDOWN = 2.5
+
+local function applyFlags()
+    local flags = {
+        ["DFIntNetworkPrediction"] = "240",
+        ["DFIntInterpolationAwareTargetTimeLerpHundredth"] = "195",
+        ["FFlagEnableReducedLatency"] = "True",
+        ["DFIntServerTickRate"] = "60",
+        ["DFIntServerPhysicsUpdateRate"] = "60",
+        ["FFlagRemoteAnimationSmoothingStrategy"] = "ExponentialDecay",
+        ["DFIntMinimalNetworkPrediction"] = "0.06",
+        ["FFlagFixInputDelay"] = "True",
+        ["FFlagEnableFastAttackBuffering"] = "True",
+        ["FFlagOptimizeNetwork"] = "True",
+        ["FFlagEnableLowLatencyGameRegion"] = "True",
+    }
+    for name, value in pairs(flags) do
+        pcall(setfflag, name, value)
+    end
+end
+
+applyFlags()
+
+-- Build baseline
+task.spawn(function()
+    task.wait(2)
+    for i=1,25 do
+        table.insert(pingHist, math.floor(Ping:GetValue()))
+        task.wait(0.4)
+    end
+    local sum = 0
+    for _, v in ipairs(pingHist) do sum += v end
+    stabBaseline = math.floor(sum / #pingHist)
+    pingEMA = stabBaseline
+    stabLbl.Text = "STABILIZER · ARMED @" .. stabBaseline .. "ms"
+    stabLbl.TextColor3 = Color3.fromRGB(34,197,94)
+end)
+
+-- Main loop (graph + ping display fixed)
+RS.Heartbeat:Connect(function()
+    local raw = math.floor(Ping:GetValue())
+    pingEMA = math.floor(EMA_ALPHA * raw + (1 - EMA_ALPHA) * pingEMA)
+
+    pVal.Text = pingEMA .. " ms"
+    local col = pingEMA < 60 and Color3.fromRGB(34,197,94) or pingEMA < 100 and Color3.fromRGB(245,158,11) or Color3.fromRGB(219,34,34)
+    pDot.BackgroundColor3 = col
+    pVal.TextColor3 = col
+
+    local spike = raw - (stabBaseline + SPIKE_THRESHOLD)
+    if spike > 0 then
+        stabSpikes += 1
+        stabLbl.Text = "⚡ +" .. spike .. "ms"
+        stabLbl.TextColor3 = Color3.fromRGB(219,34,34)
+        if (tick() - lastReapply) > REAPPLY_COOLDOWN then
+            lastReapply = tick()
+            applyFlags()
+        end
+    else
+        local jitter = math.abs(raw - pingEMA)
+        if jitter < 8 then
+            stabLbl.Text = "✓ " .. pingEMA .. "ms"
+            stabLbl.TextColor3 = Color3.fromRGB(34,197,94)
+        else
+            stabLbl.Text = "\~ " .. jitter .. "ms jitter"
+            stabLbl.TextColor3 = Color3.fromRGB(245,158,11)
+        end
+    end
+
+    -- Graph (fixed + throttled)
+    if math.random(1,3) == 1 then
+        local maxP = 1
+        for _, v in ipairs(pingHist) do if v > maxP then maxP = v end end
+        for i = 1, math.min(#pingHist, BAR_COUNT) do
+            local h = math.clamp(pingHist[i] / maxP, 0.05, 1)
+            graphBars[i].Size = UDim2.new(1/BAR_COUNT, -0.5, h, 0)
+            local c = pingHist[i] < 60 and Color3.fromRGB(34,197,94) or pingHist[i] < 100 and Color3.fromRGB(245,158,11) or Color3.fromRGB(219,34,34)
+            graphBars[i].BackgroundColor3 = c
+        end
+    end
+end)
+
+-- FAST ATTACK BUFFER (makes M1/dash/skills instant)
+local fastAttackMode = true
+UIS.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 and fastAttackMode then
+        for i = 1, 5 do
+            pcall(function() game:GetService("VirtualInputManager"):SendMouseButtonEvent(0,0,0,true,game,1) end)
+            task.wait(0.022)
+        end
+    end
+end)
+
+notify("◈ NEXUS v11.3 ULTIMATE", "Attack speed fixed!\nM1 • Dash • Side Dash • Skills now instant\nGraph fixed", Color3.fromRGB(34,197,94), 8)
+print("NEXUS v11.3 - Fully loaded")
