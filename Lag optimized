@@ -1,0 +1,397 @@
+--[[ TSB ANTI-LAG v4.1 — Optimized & Compact ]]
+
+-- Services (cached)
+local RS,Players,Stats,WS,Lighting,UIS,TS =
+    game:GetService("RunService"), game:GetService("Players"),
+    game:GetService("Stats"),     game:GetService("Workspace"),
+    game:GetService("Lighting"),  game:GetService("UserInputService"),
+    game:GetService("TweenService")
+
+local LP,PGui = Players.LocalPlayer, Players.LocalPlayer:WaitForChild("PlayerGui")
+local floor,max,min,clamp,fmt = math.floor,math.max,math.min,math.clamp,string.format
+local GC,tickf,taskd,taskdl,tasksp,taskw =
+    collectgarbage,tick,task.defer,task.delay,task.spawn,task.wait
+
+-- Config
+local C = {
+    FPS=60, PingSpike=160, EWMA_UP=0.35, EWMA_DN=0.10,
+    SpikeGC={80,260,550,900}, SpikeReset=7, NetClean=18,
+    MemClean=10, MemCrit=400, GCBudget=110,
+    LagWarn=0.055, LagCrit=0.12, GuiHz=6, MobScale=1.25,
+}
+
+-- State
+local S = {
+    active=true, rawPing=0, smPing=0, pSpikes=0, lSpikes=0,
+    fps=60, spikeLevel=0, lastSpike=0, lastNet=0, lastMem=0,
+    lastGui=0, gcBucket=0, startTime=tickf(), conns={},
+}
+
+local function conn(c) table.insert(S.conns,c) end
+local function addGC(n) S.gcBucket=S.gcBucket+n end
+local function getMem() return floor(GC("count")/1024*10)/10 end
+local function isMob() return UIS.TouchEnabled and not UIS.KeyboardEnabled end
+local function EWMA(o,n,a) return a*n+(1-a)*o end
+
+-- Ping stat cached
+local pingStat; pcall(function()
+    pingStat=Stats.Network.ServerStatsItem["Data Ping"]
+end)
+local function getPing()
+    if pingStat then local ok,v=pcall(function() return floor(pingStat:GetValue()) end)
+        if ok then return v end end return S.smPing
+end
+
+-- Classes for fast lookup
+local PARTICLES={ParticleEmitter=true,Fire=true,Smoke=true,Sparkles=true}
+local SHADOWS={BasePart=true,UnionOperation=true,MeshPart=true,Part=true,WedgePart=true}
+local LIGHTS={PointLight=true,SpotLight=true,SurfaceLight=true}
+local POSTFX={BloomEffect=true,DepthOfFieldEffect=true,SunRaysEffect=true,
+              ColorCorrectionEffect=true,BlurEffect=true}
+
+-- FPS cap
+pcall(function() if setfpscap then setfpscap(C.FPS) end end)
+pcall(function() if syn then syn.fps_cap(C.FPS) end end)
+pcall(function() settings().Rendering.QualityLevel=1 end)
+
+-- Lighting nuke
+pcall(function() Lighting.Technology=Enum.Technology.Compatibility end)
+Lighting.GlobalShadows=false; Lighting.FogEnd=9e5; Lighting.FogStart=9e5-1
+Lighting.ClockTime=14; Lighting.GeographicLatitude=0
+
+local function killFX(v)
+    if not v or not v.Parent then return end
+    if POSTFX[v.ClassName] then pcall(function() v.Enabled=false end) end
+    if v.ClassName=="Atmosphere" then pcall(function()
+        v.Density=0; v.Glare=0; v.Haze=0; v.Offset=0
+    end) end
+end
+for _,v in ipairs(Lighting:GetChildren()) do killFX(v) end
+conn(Lighting.ChildAdded:Connect(function(v) taskd(function() killFX(v) end) end))
+
+-- Terrain
+pcall(function()
+    local t=WS:FindFirstChildOfClass("Terrain")
+    if t then t.WaterWaveSize=0;t.WaterWaveSpeed=0;t.WaterReflectance=0
+             t.WaterTransparency=1;t.Decoration=false end
+end)
+
+-- Part sanitizer (single pass, class-lookup)
+local charSet={}
+local function rebuildChars()
+    charSet={}
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p.Character then charSet[p.Character]=true end
+    end
+end
+local function inChar(v)
+    local a=v
+    for _=1,8 do a=a.Parent; if not a then return false end
+        if charSet[a] then return true end end return false
+end
+
+local function sanitize(v)
+    local cn=v.ClassName
+    pcall(function()
+        if SHADOWS[cn]  then v.CastShadow=false end
+        if PARTICLES[cn] then
+            if cn=="ParticleEmitter" then v.Rate=0 end; v.Enabled=false
+        end
+        if cn=="Decal" or cn=="Texture" then v.Transparency=1 end
+        if cn=="SurfaceAppearance" then v:Destroy(); return end
+        if cn=="Beam" or cn=="Trail" then v.Enabled=false end
+        if LIGHTS[cn] and not inChar(v) then v.Enabled=false end
+    end)
+end
+
+local function batchScan(model)
+    if not model then return end
+    local list=model:GetDescendants(); local i=0; local n=#list
+    local function step()
+        for _=1,80 do i+=1; if i>n then return end; sanitize(list[i]) end
+        if i<n then taskd(step) end
+    end; taskd(step)
+end
+
+local function onChar(char)
+    if not char then return end
+    taskdl(0.1,rebuildChars); taskdl(0.6,function() batchScan(char) end)
+end
+
+-- Watch players
+rebuildChars()
+for _,p in ipairs(Players:GetPlayers()) do
+    if p.Character then onChar(p.Character) end
+    conn(p.CharacterAdded:Connect(onChar))
+end
+conn(Players.PlayerAdded:Connect(function(p)
+    conn(p.CharacterAdded:Connect(onChar))
+    if p.Character then onChar(p.Character) end
+end))
+conn(Players.PlayerRemoving:Connect(function() taskdl(0.1,rebuildChars) end))
+onChar(LP.Character or LP.CharacterAdded:Wait())
+conn(LP.CharacterAdded:Connect(onChar))
+
+-- Live effect watcher
+conn(WS.DescendantAdded:Connect(function(v)
+    if S.active then taskd(function() if v and v.Parent then sanitize(v) end end) end
+end))
+
+-- Initial workspace scan
+taskd(function() batchScan(WS) end)
+
+-- GC manager (frame-budgeted)
+conn(RS.Heartbeat:Connect(function()
+    if S.gcBucket<=0 then return end
+    local w=min(S.gcBucket,C.GCBudget)
+    GC("step",w); S.gcBucket=max(0,S.gcBucket-w)
+end))
+
+-- Ping system
+conn(RS.Heartbeat:Connect(function()
+    if not S.active then return end
+    local now=tickf(); local raw=getPing()
+    S.rawPing=raw
+    S.smPing=floor(EWMA(S.smPing,raw,raw>S.smPing and C.EWMA_UP or C.EWMA_DN))
+    if raw>C.PingSpike then
+        S.pSpikes+=1
+        if (now-S.lastSpike)<2.5 then S.spikeLevel=min(S.spikeLevel+1,4) end
+        S.lastSpike=now
+        addGC(C.SpikeGC[max(1,S.spikeLevel)] or 80)
+    elseif (now-S.lastSpike)>C.SpikeReset and S.spikeLevel>0 then
+        S.spikeLevel-=1
+    end
+    if (now-S.lastNet)>=C.NetClean then S.lastNet=now; addGC(180) end
+end))
+
+-- Lag spike killer
+conn(RS.Heartbeat:Connect(function(dt)
+    if not S.active then return end
+    local now=tickf()
+    S.fps=clamp(floor(1/max(dt,0.001)),1,999)
+    if dt>C.LagCrit then
+        S.lSpikes+=1; addGC(700)
+        taskd(function()
+            for _,v in ipairs(WS:GetDescendants()) do
+                if PARTICLES[v.ClassName] then
+                    pcall(function() if v.ClassName=="ParticleEmitter" then v.Rate=0 end
+                        v.Enabled=false end)
+                end
+            end
+        end)
+    elseif dt>C.LagWarn then
+        S.lSpikes+=1; addGC(280)
+    end
+    if (now-S.lastMem)>=C.MemClean then
+        S.lastMem=now
+        if getMem()>C.MemCrit then
+            tasksp(function()
+                GC("collect"); taskw(); GC("collect"); taskw()
+                for _=1,3 do GC("step",300); taskw() end
+            end)
+        else addGC(300) end
+    end
+end))
+
+-- ══════════════════════════════════════
+--   BEAUTIFUL COMPACT GUI
+-- ══════════════════════════════════════
+local old=PGui:FindFirstChild("TSB_v4"); if old then old:Destroy() end
+local mob=isMob(); local sc=mob and C.MobScale or 1
+local PW,PH=floor(148*sc),floor(214*sc)
+local CD=floor(42*sc)  -- circle diameter
+
+local TI=function(t,s) return TweenInfo.new(t,s or Enum.EasingStyle.Quart,Enum.EasingDirection.Out) end
+local TW=TI(0.25); local TW2=TI(0.9,Enum.EasingStyle.Sine)
+
+-- Colors
+local cBG  =Color3.fromRGB(7,7,13)
+local cRow =Color3.fromRGB(15,14,23)
+local cRed =Color3.fromRGB(215,28,28)
+local cAcc =Color3.fromRGB(255,55,55)
+local cGrn =Color3.fromRGB(40,215,90)
+local cYel =Color3.fromRGB(255,190,30)
+local cWht =Color3.fromRGB(228,225,242)
+local cDim =Color3.fromRGB(78,74,102)
+local cBrd =Color3.fromRGB(35,28,52)
+
+local function mkCorner(r,p) local c=Instance.new("UICorner")
+    c.CornerRadius=UDim.new(r>1 and 0 or 1,r>1 and r or 0); c.Parent=p end
+local function mkStroke(col,th,tr,p) local s=Instance.new("UIStroke")
+    s.Color=col; s.Thickness=th; s.Transparency=tr or 0; s.Parent=p end
+local function mkGrad(c0,c1,rot,p) local g=Instance.new("UIGradient")
+    g.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,c0),
+    ColorSequenceKeypoint.new(1,c1)}); g.Rotation=rot; g.Parent=p end
+local function mkLbl(props,parent)
+    local l=Instance.new("TextLabel"); l.BackgroundTransparency=1
+    l.ZIndex=202; for k,v in pairs(props) do l[k]=v end; l.Parent=parent; return l end
+
+local Screen=Instance.new("ScreenGui")
+Screen.Name="TSB_v4"; Screen.ResetOnSpawn=false
+Screen.DisplayOrder=9999; Screen.IgnoreGuiInset=true
+Screen.ZIndexBehavior=Enum.ZIndexBehavior.Sibling; Screen.Parent=PGui
+
+-- Circle button
+local Btn=Instance.new("TextButton")
+Btn.Size=UDim2.new(0,CD,0,CD); Btn.Position=UDim2.new(0,0,0.5,-CD/2)
+Btn.BackgroundColor3=cRed; Btn.BorderSizePixel=0
+Btn.Text=""; Btn.AutoButtonColor=false; Btn.ZIndex=301; Btn.Parent=Screen
+mkCorner(1,Btn); mkGrad(Color3.fromRGB(245,50,50),Color3.fromRGB(115,10,10),135,Btn)
+
+-- Gloss on circle
+local gloss=Instance.new("Frame"); gloss.ZIndex=302
+gloss.Size=UDim2.new(0.6,0,0.28,0); gloss.Position=UDim2.new(0.2,0,0.09,0)
+gloss.BackgroundColor3=Color3.fromRGB(255,255,255); gloss.BackgroundTransparency=0.8
+gloss.BorderSizePixel=0; gloss.Parent=Btn; mkCorner(1,gloss)
+
+-- Arrow on circle
+local Arrow=mkLbl({Size=UDim2.new(1,0,1,0),Text="▶",
+    Font=Enum.Font.GothamBold,TextSize=floor(11*sc),
+    TextColor3=Color3.fromRGB(255,255,255),ZIndex=303},Btn)
+
+-- Status dot on circle
+local SDot=Instance.new("Frame"); SDot.ZIndex=304
+SDot.Size=UDim2.new(0,floor(6*sc),0,floor(6*sc))
+SDot.Position=UDim2.new(0.5,-floor(3*sc),1,-floor(9*sc))
+SDot.BackgroundColor3=cGrn; SDot.BorderSizePixel=0; SDot.Parent=Btn; mkCorner(1,SDot)
+
+-- Glow ring around circle
+local Ring=Instance.new("Frame"); Ring.ZIndex=300
+Ring.Size=UDim2.new(0,CD+6,0,CD+6); Ring.Position=UDim2.new(0,-3,0.5,-(CD/2+3))
+Ring.BackgroundTransparency=1; Ring.BorderSizePixel=0; Ring.Parent=Screen
+mkCorner(1,Ring); mkStroke(cAcc,floor(2*sc),0.2,Ring)
+local ringStroke=Ring:FindFirstChildOfClass("UIStroke")
+
+-- Panel
+local Panel=Instance.new("Frame"); Panel.ZIndex=200
+Panel.Size=UDim2.new(0,PW,0,PH); Panel.Position=UDim2.new(0,-(PW+4),0.5,-PH/2)
+Panel.BackgroundColor3=cBG; Panel.BorderSizePixel=0; Panel.ClipsDescendants=false
+Panel.Parent=Screen; mkCorner(12,Panel); mkStroke(cRed,1.5,0.25,Panel)
+mkGrad(Color3.fromRGB(22,10,14),Color3.fromRGB(7,7,13),130,Panel)
+
+-- Top edge shine
+local te=Instance.new("Frame"); te.ZIndex=201
+te.Size=UDim2.new(0.55,0,0,1); te.Position=UDim2.new(0.225,0,0,0)
+te.BackgroundColor3=Color3.fromRGB(255,130,130); te.BackgroundTransparency=0.55
+te.BorderSizePixel=0; te.Parent=Panel; mkCorner(1,te)
+
+-- Header
+local HH=floor(30*sc)
+local Hdr=Instance.new("Frame"); Hdr.ZIndex=202
+Hdr.Size=UDim2.new(1,0,0,HH+8); Hdr.BackgroundColor3=Color3.fromRGB(145,14,14)
+Hdr.BorderSizePixel=0; Hdr.Parent=Panel; mkCorner(12,Hdr)
+mkGrad(Color3.fromRGB(230,36,36),Color3.fromRGB(110,10,10),95,Hdr)
+
+local HPulse=Instance.new("Frame"); HPulse.ZIndex=203
+HPulse.Size=UDim2.new(0,floor(7*sc),0,floor(7*sc))
+HPulse.Position=UDim2.new(0,floor(9*sc),0.5,-floor(3.5*sc))
+HPulse.BackgroundColor3=cGrn; HPulse.BorderSizePixel=0; HPulse.Parent=Hdr; mkCorner(1,HPulse)
+
+mkLbl({Size=UDim2.new(1,-floor(22*sc),1,0),Position=UDim2.new(0,floor(20*sc),0,0),
+    Text="⚡ TSB OPTIMIZER",Font=Enum.Font.GothamBold,TextSize=floor(10*sc),
+    TextColor3=Color3.fromRGB(255,238,238),TextXAlignment=Enum.TextXAlignment.Left,ZIndex=203},Hdr)
+
+-- Stat rows
+local STATS={
+    {"📡","PING","ms"},{"〰","SMOOTH","ms"},{"🎮","FPS","fps"},
+    {"💾","MEM","MB"},{"⚡","P.SPK",""},{"🔥","L.SPK",""},
+    {"🛡","REC",""},{"⏱","UP",""},
+}
+local vals={}; local PX=floor(6*sc); local RH=floor(20*sc); local RG=floor(3*sc)
+local startY=HH+floor(12*sc)
+
+for i,st in ipairs(STATS) do
+    local y=startY+(i-1)*(RH+RG)
+    local row=Instance.new("Frame"); row.ZIndex=202
+    row.Size=UDim2.new(1,-PX*2,0,RH); row.Position=UDim2.new(0,PX,0,y)
+    row.BackgroundColor3=cRow; row.BorderSizePixel=0; row.Parent=Panel
+    mkCorner(5,row); mkStroke(cBrd,1,0.1,row)
+
+    -- accent bar
+    local ab=Instance.new("Frame"); ab.ZIndex=203
+    ab.Size=UDim2.new(0,floor(2*sc),0.6,0); ab.Position=UDim2.new(0,floor(4*sc),0.2,0)
+    ab.BackgroundColor3=cAcc; ab.BorderSizePixel=0; ab.Parent=row; mkCorner(1,ab)
+
+    mkLbl({Size=UDim2.new(0,floor(15*sc),1,0),Position=UDim2.new(0,floor(8*sc),0,0),
+        Text=st[1],Font=Enum.Font.Gotham,TextSize=floor(9*sc),TextColor3=cAcc,ZIndex=203},row)
+    mkLbl({Size=UDim2.new(0,floor(40*sc),1,0),Position=UDim2.new(0,floor(25*sc),0,0),
+        Text=st[2],Font=Enum.Font.Gotham,TextSize=floor(7*sc),TextColor3=cDim,
+        TextXAlignment=Enum.TextXAlignment.Left,ZIndex=203},row)
+
+    local vl=mkLbl({Size=UDim2.new(1,-floor(68*sc),1,0),Position=UDim2.new(0,floor(66*sc),0,0),
+        Text="—",Font=Enum.Font.GothamBold,TextSize=floor(9*sc),TextColor3=cWht,
+        TextXAlignment=Enum.TextXAlignment.Right,TextTruncate=Enum.TextTruncate.AtEnd,ZIndex=203},row)
+    vals[st[2]]=vl
+end
+
+-- Bottom glow
+local bg=Instance.new("Frame"); bg.ZIndex=202
+bg.Size=UDim2.new(0.45,0,0,floor(1.5*sc)); bg.Position=UDim2.new(0.275,0,1,-floor(4*sc))
+bg.BackgroundColor3=cAcc; bg.BackgroundTransparency=0.45; bg.BorderSizePixel=0
+bg.Parent=Panel; mkCorner(1,bg)
+
+-- Toggle logic
+local isOpen,busy=false,false
+local P_CLOSE=UDim2.new(0,-(PW+4),0.5,-PH/2)
+local P_OPEN =UDim2.new(0,CD+5,   0.5,-PH/2)
+local B_CLOSE=UDim2.new(0,0,      0.5,-CD/2)
+local B_OPEN =UDim2.new(0,PW+CD+4,0.5,-CD/2)
+local R_CLOSE=UDim2.new(0,-3,     0.5,-(CD/2+3))
+local R_OPEN =UDim2.new(0,PW+CD+3,0.5,-(CD/2+3))
+
+local function setOpen(state)
+    if busy then return end; busy=true; isOpen=state
+    Arrow.Text=state and "◀" or "▶"
+    TS:Create(Panel,TW,{Position=state and P_OPEN or P_CLOSE}):Play()
+    TS:Create(Btn,  TW,{Position=state and B_OPEN or B_CLOSE}):Play()
+    TS:Create(Ring, TW,{Position=state and R_OPEN or R_CLOSE}):Play()
+    taskdl(0.26,function() busy=false end)
+end
+
+Btn.MouseButton1Click:Connect(function() setOpen(not isOpen) end)
+Btn.TouchTap:Connect(function() setOpen(not isOpen) end)
+taskdl(0.5,function() setOpen(true) end)
+
+-- Pulse animation
+tasksp(function()
+    local dots={HPulse,SDot}
+    while Screen.Parent do
+        for _,d in ipairs(dots) do
+            TS:Create(d,TW2,{BackgroundColor3=Color3.fromRGB(0,140,60)}):Play()
+        end
+        TS:Create(ringStroke,TW2,{Transparency=0.7}):Play()
+        taskw(0.9)
+        for _,d in ipairs(dots) do
+            TS:Create(d,TW2,{BackgroundColor3=cGrn}):Play()
+        end
+        TS:Create(ringStroke,TW2,{Transparency=0.15}):Play()
+        taskw(0.9)
+    end
+end)
+
+-- GUI update
+local LVL={"OFF","LOW","MED","HIGH","MAX"}
+local function cP(v) return v<80 and cGrn or v<150 and cYel or cAcc end
+local function cF(v) return v>=55 and cGrn or v>=30 and cYel or cAcc end
+local function cM(v) return v<300 and cGrn or v<400 and cYel or cAcc end
+local function cS(v) return v==0 and cGrn or v<5 and cYel or cAcc end
+
+conn(RS.RenderStepped:Connect(function()
+    local now=tickf()
+    if (now-S.lastGui)<(1/C.GuiHz) then return end
+    S.lastGui=now
+    local up=floor(now-S.startTime); local mem=getMem()
+
+    vals["PING"].Text=S.rawPing.."ms";  vals["PING"].TextColor3=cP(S.rawPing)
+    vals["SMOOTH"].Text=S.smPing.."ms"; vals["SMOOTH"].TextColor3=cP(S.smPing)
+    vals["FPS"].Text=S.fps.."fps";      vals["FPS"].TextColor3=cF(S.fps)
+    vals["MEM"].Text=mem.."MB";         vals["MEM"].TextColor3=cM(mem)
+    vals["P.SPK"].Text=tostring(S.pSpikes); vals["P.SPK"].TextColor3=cS(S.pSpikes)
+    vals["L.SPK"].Text=tostring(S.lSpikes); vals["L.SPK"].TextColor3=cS(S.lSpikes)
+    vals["REC"].Text=LVL[S.spikeLevel+1] or "OFF"
+    vals["REC"].TextColor3=S.spikeLevel==0 and cGrn or cYel
+    vals["UP"].Text=fmt("%dm%02ds",floor(up/60),up%60)
+    vals["UP"].TextColor3=cDim
+end))
+
+print("[TSB v4.1] ✔ All systems online — GL in TSB! ⚔️")
