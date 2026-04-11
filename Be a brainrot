@@ -1,0 +1,58 @@
+local lp=game.Players.LocalPlayer
+local RS=game:GetService("ReplicatedStorage")
+local RUN=game:GetService("RunService")
+local re=RS:FindFirstChild("invoke_server_command",true)
+local function fire(...)if re then pcall(function()re:FireServer(...)end)end end
+local function tp(p)local h=lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")if h then h.CFrame=CFrame.new(p+Vector3.new(0,3,0))end end
+local function clickAny(n)for _,g in next,lp.PlayerGui:GetChildren()do local b=g:FindFirstChild(n,true)if b then pcall(function()b.MouseButton1Click:Fire()end)return end end end
+local cfg={steal=false,speed=false,rebirth=false}
+local function stealBest()local f=workspace:FindFirstChild("Brainrots")if not f then return end local best,bv=f:GetChildren()[1],-1 for _,o in next,f:GetChildren()do local v=o:GetAttribute("Value")or 0 if v>bv then best=o bv=v end end if best then local pp=best.PrimaryPart or best:FindFirstChildWhichIsA("BasePart")if pp then tp(pp.Position)end task.wait(0.1)fire("steal",best)end end
+local function buySpeed()local npc=workspace:FindFirstChild("NPC")if npc then for _,v in next,npc:GetDescendants()do if v:IsA("BasePart")and v.Name:lower():find("speed")then tp(v.Position)task.wait(0.3)break end end end clickAny("+10")fire("buy_speed","10")end
+local function doRebirth()clickAny("Rebirth")task.wait(0.5)for _,g in next,lp.PlayerGui:GetChildren()do for _,v in next,g:GetDescendants()do if(v:IsA("TextButton")or v:IsA("ImageButton"))and v.Text and v.Text:lower()=="rebirth"then pcall(function()v.MouseButton1Click:Fire()end)end end end fire("rebirth")end
+local function goVIP()clickAny("Teleport 2nd Floor")end
+local t1,t2,t3=0,0,0
+RUN.Heartbeat:Connect(function(dt)t1+=dt t2+=dt t3+=dt if cfg.steal and t1>=2 then t1=0 pcall(stealBest)end if cfg.speed and t2>=8 then t2=0 pcall(buySpeed)end if cfg.rebirth and t3>=10 then t3=0 pcall(doRebirth)end end)
+local sg=Instance.new("ScreenGui",lp.PlayerGui)
+sg.ResetOnSpawn=false
+local panel=Instance.new("Frame",sg)
+panel.Size=UDim2.new(0,175,0,255)
+panel.Position=UDim2.new(0,4,0,4)
+panel.BackgroundColor3=Color3.fromRGB(20,20,30)
+panel.Active=false
+Instance.new("UICorner",panel).CornerRadius=UDim.new(0,8)
+local dragBar=Instance.new("Frame",panel)
+dragBar.Size=UDim2.new(1,0,0,28)
+dragBar.BackgroundColor3=Color3.fromRGB(90,40,180)
+dragBar.Active=true
+Instance.new("UICorner",dragBar).CornerRadius=UDim.new(0,8)
+local title=Instance.new("TextLabel",dragBar)
+title.Size=UDim2.new(1,0,1,0)
+title.BackgroundTransparency=1
+title.Text="🧠 BrainrotHub"
+title.TextColor3=Color3.new(1,1,1)
+title.TextSize=12
+title.Font=Enum.Font.GothamBold
+local drag,ds,sp=false,nil,nil
+dragBar.InputBegan:Connect(function(i)if i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseButton1 then drag=true ds=i.Position sp=panel.Position i.Changed:Connect(function()if i.UserInputState==Enum.UserInputState.End then drag=false end end)end end)
+dragBar.InputChanged:Connect(function(i)if drag and(i.UserInputType==Enum.UserInputType.Touch or i.UserInputType==Enum.UserInputType.MouseMovement)then local d=i.Position-ds panel.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y)end end)
+local function makeBtn(label,yPos,cb,shot)
+    local b=Instance.new("TextButton",panel)
+    b.Size=UDim2.new(0.9,0,0,38)
+    b.Position=UDim2.new(0.05,0,0,yPos)
+    b.BackgroundColor3=Color3.fromRGB(50,50,70)
+    b.TextColor3=Color3.new(1,1,1)
+    b.TextSize=11
+    b.Font=Enum.Font.GothamBold
+    b.Text=(shot and ""or"OFF | ")..label
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
+    local on=false
+    b.MouseButton1Click:Connect(function()
+        if shot then pcall(cb)b.BackgroundColor3=Color3.fromRGB(0,180,80)task.delay(0.5,function()b.BackgroundColor3=Color3.fromRGB(50,50,70)end)
+        else on=not on cb(on)b.Text=(on and"ON  | "or"OFF | ")..label b.BackgroundColor3=on and Color3.fromRGB(0,200,80)or Color3.fromRGB(50,50,70)end
+    end)
+end
+makeBtn("Steal Best",34,function(v)cfg.steal=v end)
+makeBtn("Auto Speed",80,function(v)cfg.speed=v end)
+makeBtn("Auto Rebirth",126,function(v)cfg.rebirth=v end)
+makeBtn("VIP Floor",172,function()goVIP()end,true)
+makeBtn("Rebirth Now",210,function()doRebirth()end,true)
